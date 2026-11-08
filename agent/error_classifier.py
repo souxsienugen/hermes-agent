@@ -1283,6 +1283,20 @@ def _status_5xx(c: _Ctx) -> Verdict:
     validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
+    # Deterministic TRANSCRIPT rejections also arrive as 5xx, not only as 400:
+    # Ollama's chat renderer answers a transcript with no user-role message at
+    # all with HTTP 500 {"error":{"message":"no user query found in messages"}},
+    # while the same body as a 400 is already a format_error via
+    # _INVALID_MESSAGE_BODY_PATTERNS. Classified as a transient server error,
+    # the agent retries the same poisoned request three times and gives up —
+    # burning the budget on a request that can never succeed, and (on the
+    # fallback wire) refusing to fall back because a 5xx is not a fallback
+    # trigger. The invariant "the request always carries a user turn" is
+    # enforced on the Anthropic wire and on the OpenAI wire (see
+    # agent/transports/chat_completions.py::_ensure_user_turn), so a request
+    # that still trips this signal is malformed for a reason no retry can fix.
+    if any(p in c.msg for p in _INVALID_MESSAGE_BODY_PATTERNS):
+        return _V_FORMAT_ERROR
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
 
 

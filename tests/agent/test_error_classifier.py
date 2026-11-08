@@ -487,6 +487,66 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    # ── Deterministic transcript rejections arriving as 5xx ──
+
+    def test_500_no_user_query_is_a_format_error_not_a_transient_server_error(self):
+        """Ollama answers a transcript with no user-role message with HTTP 500
+        ``no user query found in messages``.
+
+        The same body as a 400 is already a deterministic ``format_error`` (it
+        is in ``_INVALID_MESSAGE_BODY_PATTERNS``). Classified as a transient
+        server error, the agent retries the same poisoned request three times
+        and then gives up — and a 5xx is not a fallback trigger, so the turn
+        dies on the very provider the fallback chain walked to.
+        """
+        body = {"error": {"message": "no user query found in messages", "type": "api_error"}}
+        e = MockAPIError("no user query found in messages", status_code=500, body=body)
+        result = classify_api_error(e, provider="ollama", model="qwen3.8:27b")
+        assert result.reason == FailoverReason.format_error
+        # No retry: the request shape is wrong, and no retry can fix it.
+        assert result.retryable is False
+        # Fall back: another provider CAN serve a well-formed request.
+        assert result.should_fallback is True
+        # Compression cannot invent the missing turn.
+        assert result.should_compress is False
+
+    def test_400_and_500_no_user_query_classify_identically(self):
+        """The verdict must not depend on the status code the same body arrives
+        with — that drift is what made the 500 path retry a poisoned request."""
+        body = {"error": {"message": "no user query found in messages", "type": "api_error"}}
+        for status in (400, 500):
+            e = MockAPIError("no user query found in messages", status_code=status, body=body)
+            result = classify_api_error(e, provider="ollama")
+            assert result.reason == FailoverReason.format_error, status
+            assert result.retryable is False, status
+            assert result.should_fallback is True, status
+
+    def test_500_invalid_message_body_patterns_are_format_errors(self):
+        """Every deterministic transcript rejection in
+        ``_INVALID_MESSAGE_BODY_PATTERNS`` must fail fast when it arrives as a
+        5xx too, not only as a 400."""
+        from agent.error_classifier import _INVALID_MESSAGE_BODY_PATTERNS
+
+        for pattern in _INVALID_MESSAGE_BODY_PATTERNS:
+            e = MockAPIError(pattern, status_code=500)
+            result = classify_api_error(e, provider="ollama")
+            assert result.reason == FailoverReason.format_error, pattern
+            assert result.retryable is False, pattern
+
+    def test_500_genuine_server_error_is_still_transient(self):
+        """The 5xx fast-path must not swallow real transient failures."""
+        e = MockAPIError("Internal Server Error", status_code=500)
+        result = classify_api_error(e, provider="ollama")
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+
+    def test_500_overflow_is_still_overflow(self):
+        """A context-overflow reported as a 500 must still enter compression."""
+        e = MockAPIError("context length exceeded", status_code=500)
+        result = classify_api_error(e, provider="ollama")
+        assert result.reason == FailoverReason.context_overflow
+        assert result.should_compress is True
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server
