@@ -25,6 +25,18 @@ Two facts make this a real defect and not a config mistake:
    If that list carries a user turn, the fallback request carries it too. So
    the fallback request losing the user turn means the message list itself was
    rewritten somewhere between the primary's request and the fallback's.
+
+HOW THE TRANSCRIPT LOSES ITS USER TURN
+---------------------------------------
+The list is rewritten by the per-turn ``ContextEngine.select_context()`` hook
+(``agent/conversation_loop.py::_apply_context_engine_selection``): it may
+REPLACE the request outright, and it runs before every request sanitizer, so
+a replacement that carries no user-role message reaches the wire as-is. This
+test installs a context engine that does exactly that, so the lossy transcript
+is produced by a real product path rather than by hand-poking the transport.
+
+The engine is deliberately hostile: it drops EVERY user row, which is the
+shape Ollama refuses with HTTP 500 ``no user query found in messages``.
 """
 
 from __future__ import annotations
@@ -66,6 +78,52 @@ KNOWN: dict[str, tuple[str, str]] = {
         "died with the account-level 429 it was installed to survive",
     ),
 }
+
+# A context engine that replaces the request with a transcript carrying NO
+# user-role message. This is the production trigger: select_context() may
+# replace the request outright, and it runs BEFORE every request sanitizer, so
+# a user-turn-free replacement reaches the provider as-is.
+_LOSER_ENGINE_PLUGIN = '''\
+"""Test context engine: strips every user turn from the outbound request."""
+from agent.context_engine import ContextEngine
+
+
+class UserTurnStrippingEngine(ContextEngine):
+    @property
+    def name(self):
+        return "user-turn-stripping"
+
+    def should_compress(self, prompt_tokens=None):
+        return False
+
+    def compress(self, messages, current_tokens=None):
+        return messages
+
+    def update_from_response(self, usage):
+        pass
+
+    def select_context(self, request_messages, *, conversation_messages=None,
+                       incoming_message=None, budget_tokens=0):
+        return [m for m in request_messages if m.get("role") != "user"]
+
+
+def register(ctx):
+    ctx.register_context_engine(UserTurnStrippingEngine())
+'''
+
+_ENGINE_NAME = "user-turn-stripping"
+
+
+def _install_user_turn_stripping_engine(h: Home) -> None:
+    """Install the lossy context engine into the child's HERMES_HOME.
+
+    The loader resolves user context engines from ``$HERMES_HOME/plugins/<name>/``
+    (``plugins/context_engine/__init__.py::find_engine_dir``), and the harness
+    points HERMES_HOME at a throwaway dir, so the plugin is isolated per test.
+    """
+    plugin_dir = h.hermes_home / "plugins" / _ENGINE_NAME
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "__init__.py").write_text(_LOSER_ENGINE_PLUGIN, encoding="utf-8")
 
 
 def _fallback_config(primary_url: str, backup_url: str) -> dict:
@@ -116,7 +174,11 @@ def test_fallback_request_carries_the_user_turn(tmp_path) -> None:
         with FakeChatVariantServer(_Always429(), strict_user_turn=False) as primary:
             cfg = _fallback_config(primary.base_url, backup.base_url)
             cfg["agent"] = {"auto_recovery_cycles": 0}
+            # Select the lossy context engine: it strips every user turn from
+            # the outbound request, which is what the OpenAI wire must survive.
+            cfg["context"] = {"engine": _ENGINE_NAME}
             h.write(cfg, dotenv={"OPENAI_API_KEY": "loopback-only", "OLLAMA_API_KEY": "ollama"})
+            _install_user_turn_stripping_engine(h)
             (h.project / "a.txt").write_text("CANARY-A\n", encoding="utf-8")
             try:
                 run = bounded_turn(h, "read a.txt", STRICT_TURN_BUDGET)
