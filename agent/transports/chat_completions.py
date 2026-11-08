@@ -6,6 +6,7 @@ provider-specific work lives in build_kwargs (max_tokens, reasoning, extra_body)
 
 import hashlib
 import json
+import logging
 import re
 import string
 from typing import Any
@@ -21,6 +22,15 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+logger = logging.getLogger(__name__)
+
+# Text used for the synthetic user turn inserted when an outbound OpenAI-wire
+# request carries no user-role message at all. It MUST be non-whitespace:
+# several providers reject a text block whose content is empty or
+# whitespace-only, so a bare space would trade the "no user query found"
+# 500 for a different 400.
+_MISSING_USER_TURN_PLACEHOLDER = "(continuing the previous turn)"
 
 # xAI reserves ``tool_search`` for its server-side tool (HTTP 400 on client
 # declarations); aliased on the wire, mapped back in normalize_response.
@@ -72,6 +82,59 @@ def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
         return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         return str(content or "")
+
+
+def _ensure_user_turn(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Guarantee the outgoing OpenAI-wire request carries a USER-role message.
+
+    The Anthropic wire already enforces this invariant
+    (``agent/anthropic_message_convert.py::_ensure_leading_user_turn``),
+    because Anthropic's Messages API rejects a transcript whose first turn is
+    not a user turn. The OpenAI wire had NO equivalent, and several
+    strict-alternation chat templates (llama.cpp / vLLM Jinja templates,
+    Qwen-family models served by Ollama) answer a request that contains NO
+    user-role message at all with::
+
+        HTTP 500  {"error": {"message": "no user query found in messages"}}
+
+    That is not cosmetic. A long agentic session can lose its user turn
+    (a compaction leaves an assistant summary first, a thinking-only
+    assistant turn is dropped, a resume restores a tool-only tail), and the
+    resulting request is then rejected as a TRANSIENT server error, so the
+    agent retries the same poisoned request three times and gives up. When
+    the request that fails is the one that walked the ``fallback_providers``
+    chain (primary = an account-level 429 -> fallback = local Ollama), the
+    escape hatch dies with the very failure it was installed to survive.
+
+    Fix: on the OpenAI wire, guarantee at least one user-role message
+    exists. When none does, insert a placeholder user turn AFTER the system
+    prompt (so the system prefix stays first and the cache prefix is
+    untouched) and leave the rest of the transcript alone.
+
+    The placeholder text is non-whitespace on purpose: several providers
+    reject a text block whose content is empty or whitespace-only, so a
+    bare space would trade this 500 for a different 400.
+
+    Returns the input list unchanged when a user turn is already present —
+    this is the common case and must not allocate.
+    """
+    if any(isinstance(m, dict) and m.get("role") == "user" for m in messages):
+        return messages
+
+    placeholder: dict[str, Any] = {"role": "user", "content": _MISSING_USER_TURN_PLACEHOLDER}
+
+    insert_at = 0
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") in {"system", "developer"}:
+        insert_at = 1
+
+    out = list(messages)
+    out.insert(insert_at, placeholder)
+    logger.warning(
+        "Outbound request carried no user-role message; inserted a placeholder user turn "
+        "(roles=%s)",
+        [m.get("role") for m in messages if isinstance(m, dict)],
+    )
+    return out
 
 
 def _add_prompt_cache_key(
@@ -577,6 +640,24 @@ class ChatCompletionsTransport(ProviderTransport):
             messages, model=model, base_url=params.get("base_url"), provider_profile=_profile,
             provider=params.get("provider_name"),
         )
+        # The OpenAI wire has NO equivalent of the Anthropic wire's
+        # _ensure_leading_user_turn guard. Strict chat templates
+        # (llama.cpp / vLLM Jinja templates, Qwen served by Ollama) answer a
+        # transcript that carries no user-role message at all with::
+        #
+        #     HTTP 500  {"error": {"message": "no user query found in messages"}}
+        #
+        # That 500 is classified as a TRANSIENT server error, so the agent
+        # retries the same poisoned request three times and then gives up.
+        # When the failing request is the one that walked the
+        # ``fallback_providers`` chain (primary = an account-level 429,
+        # fallback = local Ollama), the escape hatch dies with the very
+        # failure it was installed to survive.
+        #
+        # Enforce the invariant HERE, at payload assembly, so
+        # convert_messages stays a pure sanitizer (callers rely on it
+        # returning the same list when there is nothing to strip).
+        sanitized = _ensure_user_turn(sanitized)
         if _profile:
             return self._build_kwargs_from_profile(_profile, model, sanitized, tools, params)
 

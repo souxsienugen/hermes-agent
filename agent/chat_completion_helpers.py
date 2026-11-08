@@ -2178,6 +2178,9 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
     # rows still share nested dicts with history, so clone first like the main path does.
     api_messages = [_clone_message_for_send(m) for m in api_messages]
     _sanitize_messages_surrogates(api_messages)
+    # The user-turn invariant is enforced on the OpenAI wire by
+    # ChatCompletionsTransport.build_kwargs, which this path reaches via
+    # agent._build_api_kwargs -> _build_chat_completions_kwargs.
     return api_messages
 
 
