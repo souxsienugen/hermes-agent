@@ -48,7 +48,16 @@ from tests.fakes.providers.chat_variants import CText, CTools, FakeChatVariantSe
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subprocess harness is Linux-gated")
 
-STRICT_TURN_BUDGET = 60.0
+# This test runs ONE turn, but the harness spawns a real `hermes -z` child that
+# first prepares an isolated runtime for its throwaway HERMES_HOME ("preparing
+# dependencies for this data root"). That setup is a FIXED cost paid before the
+# turn starts, and it is environment-dependent: with no PyPI reach it falls back
+# to a local sync, which on a loaded host takes tens of seconds. The 60s budget
+# used by test_chat_custom_endpoint.py does not fit here — that file runs TWO
+# turns, so it can only afford a tighter per-turn slice, while this one gets
+# the whole allowance for a single turn. 180s leaves room for the prep plus the
+# turn on a host at load ~35 without turning a slow machine into a red test.
+STRICT_TURN_BUDGET = 180.0
 
 KNOWN: dict[str, tuple[str, str]] = {
     "fallback_keeps_user_turn": (
