@@ -894,6 +894,10 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
     if a["reasoning_effort"] is not None:
         # CLI-only lane; update_job validates, empty string clears the pin.
         updates["reasoning_effort"] = a["reasoning_effort"]
+    if a["max_turns"] is not None:
+        # CLI-only lane; a per-job HARD cap on the run's agent iterations.
+        # Empty string clears the cap (the job inherits the global agent.max_turns).
+        updates["max_turns"] = a["max_turns"]
     if a["interpreter"] is not None:
         # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
         updates["interpreter"] = a["interpreter"]
@@ -1079,7 +1083,8 @@ def cronjob(
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
-    grace_minutes: Optional[int | str] = None) -> str:
+    grace_minutes: Optional[int | str] = None,
+    max_turns: Optional[int | str] = None) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
