@@ -2448,10 +2448,19 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
     # resolve_turn_limit() honors none/unlimited (sys.maxsize) and explicit 0 / null.
     from hermes_cli.config import resolve_turn_limit as _resolve_turn_limit
-    _mt = _cfg.get("agent", {}).get("max_turns")
-    if _mt is None:
-        _mt = _cfg.get("max_turns")
-    setup.max_iterations = _resolve_turn_limit(_mt)
+    # The fleet-wide agent.max_turns is the CEILING; a job's max_turns may only
+    # tighten it. A noisy schedule (a 15-minute sweep) must not be able to run
+    # the whole fleet budget, and no single job may be used to raise the budget
+    # the operator set for everyone else.
+    _global_mt = _cfg.get("agent", {}).get("max_turns")
+    if _global_mt is None:
+        _global_mt = _cfg.get("max_turns")
+    _global_limit = _resolve_turn_limit(_global_mt)
+    _job_mt = job.get("max_turns")
+    if _job_mt is None:
+        setup.max_iterations = _global_limit
+    else:
+        setup.max_iterations = min(_resolve_turn_limit(_job_mt), _global_limit)
 
     # Runtime backstop (CWE-200/522): fail closed BEFORE resolution on a provider/base_url pair
     # that would ship a stored credential off-host; hand-written jobs bypass create-time checks.

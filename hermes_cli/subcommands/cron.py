@@ -106,6 +106,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         help="Catch-up window override in minutes (0-1440) for a cron schedule. "
             "Default: half the period, clamped to 2-120 minutes. 0 = never catch up "
             "(a missed occurrence is skipped, not run late).")
+    cron_create.add_argument("--max-turns", dest="max_turns", type=int,
+        help="HARD cap on this job's agent iterations per run. Overrides the global agent.max_turns for this job only, so a noisy schedule cannot consume the whole fleet budget. Pass empty string to clear.")
     cron_create.add_argument(
         "--continuity", dest="continuity", action="store_const", const=True, default=None,
         help="Each run wakes up with the job's own previous output injected "
@@ -183,6 +185,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--grace-minutes", dest="grace_minutes",
         help="Catch-up window override in minutes (0-1440). 0 = never catch up. "
             "Pass empty string to restore the computed window.")
+    cron_edit.add_argument("--max-turns", dest="max_turns", type=int,
+        help="HARD cap on this job's agent iterations per run. Overrides the global agent.max_turns for this job only, so a noisy schedule cannot consume the whole fleet budget. Pass empty string to clear.")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

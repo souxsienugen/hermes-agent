@@ -460,6 +460,8 @@ def _apply_skill_fields(job: dict[str, Any]) -> dict[str, Any]:
     """Return a job dict with canonical `skills` and legacy `skill` fields aligned."""
     normalized = dict(job)
     skills = _normalize_skill_list(normalized.get("skill"), normalized.get("skills"))
+    if "max_turns" in normalized:
+        normalized["max_turns"] = _normalize_job_max_turns(normalized.get("max_turns"))
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
     return normalized
@@ -502,6 +504,35 @@ def _schedule_display_for_job(job: dict[str, Any]) -> str:
     elif schedule is not None:
         return str(schedule)
     return "?"
+
+
+def _normalize_job_max_turns(value: Any) -> int | None:
+    """Normalize a per-job agent-turn cap to a positive int, or None for "unset".
+
+    ``None``/empty means the job inherits the fleet-wide ``agent.max_turns``.
+    A cap is a HARD limit on the run's agent iterations: the run stops there
+    instead of consuming the whole global budget, so a noisy schedule cannot
+    monopolise the provider quota.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = int(value)
+    elif isinstance(value, str):
+        s = value.strip().lower()
+        if not s:
+            return None
+        if s in {"none", "null", "unlimited", "infinite", "infinity", "inf", "\u221e", "-1", "0"}:
+            return None
+        try:
+            n = int(float(s))
+        except ValueError:
+            raise ValueError(f"max_turns must be an integer, got {value!r}")
+    else:
+        raise ValueError(f"max_turns must be an integer, got {value!r}")
+    if n <= 0:
+        return None
+    return n
 
 
 def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
@@ -1767,6 +1798,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "max_turns": _normalize_job_max_turns,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
