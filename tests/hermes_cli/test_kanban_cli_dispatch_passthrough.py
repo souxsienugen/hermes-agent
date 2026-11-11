@@ -8,6 +8,7 @@ operator footgun that only manifests in long-running setups.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -94,5 +95,50 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     assert captured.get("max_spawn") == 2, (
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
+
+
+def test_cli_dispatch_json_reports_capacity_hold(isolated_kanban_home, monkeypatch, capsys):
+    """A tick refused by a concurrency cap must say so in the CLI JSON.
+
+    Without this the operator's only signal was a bare zero-spawn count, and
+    a ceiling-bound backlog was indistinguishable from a quota-parked one —
+    the ambiguity that made the capacity ceiling hard to diagnose from the
+    command line.
+    """
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+
+    result = kanban_db.DispatchResult()
+    result.capacity_hold = "max_in_progress"
+    monkeypatch.setattr(kbd, "dispatch_once", lambda conn, **kw: result)
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=True)
+    kb_cli._cmd_dispatch(args)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload.get("capacity_hold") == "max_in_progress"
+
+
+def test_cli_dispatch_text_reports_capacity_hold(isolated_kanban_home, monkeypatch, capsys):
+    """The human-readable CLI output names the ceiling that refused the tick."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+
+    result = kanban_db.DispatchResult()
+    result.capacity_hold = "max_in_progress"
+    monkeypatch.setattr(kbd, "dispatch_once", lambda conn, **kw: result)
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    kb_cli._cmd_dispatch(args)
+
+    out = capsys.readouterr().out
+    assert "max_in_progress" in out
+    assert "Capacity hold" in out
 
 

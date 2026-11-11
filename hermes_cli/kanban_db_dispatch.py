@@ -149,6 +149,15 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    capacity_hold: Optional[str] = None
+    """Which concurrency ceiling refused this tick's spawns, when the refusal
+    was a CAP rather than a per-task skip: ``"max_in_progress"`` (the host-wide
+    cap was already full) or ``"max_spawn"`` (the per-board cap was already
+    full). ``None`` when the tick was not refused for capacity reasons.
+    Reported by :func:`describe_suppression` so a ceiling-bound backlog is
+    distinguishable from a quota-parked one in the "dispatcher stuck" warning
+    — without it the warning names no cause and every ceiling stall reads like
+    an unexplained hang."""
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
