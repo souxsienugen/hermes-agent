@@ -156,6 +156,56 @@ def subtree_touched_since(path: Path, cutoff: float) -> bool:
     return subtree_touch_state(path, cutoff) != _IDLE
 
 
+_NO_PRUNE_MARKER = ".no_prune"
+
+
+def _contains_no_prune_marker(entry: Path) -> bool:
+    """True if *entry* carries a :data:`_NO_PRUNE_MARKER` sentinel at its top level
+    or anywhere in its subtree. The convention lets a caller opt the entry (or any
+    nested artifact in it) out of the idle prune with a single dotfile.
+
+    Top-level first: the documented placement is ``<entry>/.no_prune``, so a happy
+    path costs one ``stat``. Symlinks at the entry root do not honor a marker at
+    the link — the prune treats them as files (``unlink``), not dirs (``rmtree``),
+    and following the link would let the link target ``.no_prune`` silently freeze
+    every symlink pointing at it. Subtree scan: markers placed deeper are honored
+    too, so a sub-task can protect a subtree without owning the entry's other
+    leaves; :func:`os.scandir` does not follow links, matching :func:`subtree_touched_since`.
+    A missing or unreadable entry ends the walk with ``False``.
+    """
+    # Fast path: directory only, and the marker must live inside the entry, not at
+    # the link target. ``is_dir()`` follows symlinks — the ``not is_symlink()`` guard
+    # keeps the fast path consistent with the deep scan's symlink policy.
+    try:
+        if entry.is_dir() and not entry.is_symlink() and (entry / _NO_PRUNE_MARKER).exists():
+            return True
+    except OSError:
+        pass
+    try:
+        if not entry.is_dir() or entry.is_symlink():
+            return False
+    except OSError:
+        return False
+    stack = [str(entry)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for child in it:
+                    try:
+                        if child.name == _NO_PRUNE_MARKER:
+                            return True
+                    except OSError:
+                        continue
+                    try:
+                        if child.is_dir(follow_symlinks=False):
+                            stack.append(child.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return False
+
+
 def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
@@ -420,7 +470,16 @@ def prune_idle_entries(
     *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
     Each removal, each signalled process and each entry rescued mid-prune (touched
     again after selection) is recorded in *log_file*. Returns the count actually
-    removed."""
+    removed.
+
+    A top-level ``.no_prune`` file at *root/<name>/.no_prune* — or one anywhere in
+    the entry's subtree — opts that entry out of the prune: the marker is recorded
+    once in the audit log and the entry is left untouched, even when nothing inside
+    it has written in :data:`_NO_PRUNE_MARKER`. Use it to keep sealed artifacts,
+    parked evidence, or any package the operator has explicitly frozen beyond the
+    idle window. The marker itself is just a name: a regular file or a directory
+    works, and removing it puts the entry back under the ordinary retention rule.
+    """
     audit = _open_prune_log(log_file)
     try:
         return _prune_idle_entries(root, max_idle_hours, skip_names, audit)
@@ -450,6 +509,27 @@ def _prune_idle_entries(
             # A dir this user may not list (root-owned 0700) fails every idle scan: kept
             # (fail-closed) as before, but reported once and no longer re-scanned hourly.
             stuck.record(root, e, [denied_dir], audit)
+    # Honor a `.no_prune` marker at the entry root or anywhere in its subtree: the
+    # convention lets a caller protect content beyond the prune's horizon (sealed
+    # artifacts, parked evidence) by dropping a single dotfile. Filtered here, not
+    # at entry selection, so the marker check only runs for entries we already
+    # know would be deleted — cost is bounded by ``len(doomed)``, not by every
+    # scratch entry. Each kept entry is recorded once in the audit log so the
+    # reason an entry survived a cycle is not a guess.
+    if doomed:
+        marker_kept: list[Path] = []
+        kept: list[Path] = []
+        for entry in doomed:
+            if _contains_no_prune_marker(entry):
+                marker_kept.append(entry)
+            else:
+                kept.append(entry)
+        doomed = kept
+        for entry in marker_kept:
+            audit.info(
+                "scratch prune: kept %r — .no_prune marker present, left untouched",
+                os.fspath(entry),
+            )
     # Runs even with nothing to delete: orphans whose cwd was removed by an earlier pass
     # (or by hand) are found by the deleted-cwd rule, not by membership in ``doomed``.
     try:

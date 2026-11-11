@@ -172,6 +172,7 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacity: Optional[str] = None
     for res in results:
         if res is None:
             continue
@@ -181,11 +182,19 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.skipped_per_profile_capped:
+            counts["per_profile_capped"] = counts.get("per_profile_capped", 0) + len(
+                res.skipped_per_profile_capped
+            )
         if res.memory_pressure:
             pressure = res.memory_pressure
+        if res.capacity_hold:
+            capacity = res.capacity_hold
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    if capacity:
+        parts.append(f"capacity_hold={capacity}")
     return ", ".join(parts)
 
 
@@ -1930,13 +1939,22 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
         return 0
 
 
-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
-    """Total ``running`` tasks across every board EXCEPT ``board``.
+def _running_tasks_other_boards(
+    board: Optional[str] = None,
+) -> tuple[int, dict[str, int]]:
+    """``(total, per_assignee)`` ``running`` task counts across every board
+    EXCEPT ``board``, in ONE pass over the board list.
 
     Caps bound the HOST, but each board's tick only sees its own DB; without
     this a derived cap of N gets multiplied by the number of active boards.
     Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
+    board to one file) yields ``(0, {})`` — no double counting. Fails open per
+    board.
+
+    The per-assignee breakdown backs the per-profile cap, which protects ONE
+    profile's local model / browser pool / quota — host resources shared by
+    every board — so a profile already running on another board holds its slot
+    there too.
     """
     try:
         current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
@@ -1945,8 +1963,9 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     try:
         boards = _kb.list_boards(include_archived=False)
     except Exception:
-        return 0
+        return 0, {}
     total = 0
+    counts: dict[str, int] = {}
     for meta in boards:
         slug = meta.get("slug") or _kb.DEFAULT_BOARD
         try:
@@ -1959,12 +1978,48 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
             other = _kbc.connect(board=slug)
             try:
                 total += count_running_tasks(other)
+                for prow in other.execute(
+                    "SELECT assignee, COUNT(*) AS n FROM tasks "
+                    "WHERE status = 'running' AND assignee IS NOT NULL "
+                    "GROUP BY assignee"
+                ):
+                    name = prow["assignee"]
+                    counts[name] = counts.get(name, 0) + int(prow["n"])
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
         except Exception:
             continue
-    return total
+    return total, counts
+
+
+def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
+    """Total ``running`` tasks across every board EXCEPT ``board``.
+
+    Caps bound the HOST, but each board's tick only sees its own DB; without
+    this a derived cap of N gets multiplied by the number of active boards.
+    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
+    board to one file) yields 0. Fails open per board.
+    """
+    return _running_tasks_other_boards(board)[0]
+
+
+def count_running_tasks_by_assignee_other_boards(
+    board: Optional[str] = None,
+) -> dict[str, int]:
+    """``running`` task counts per assignee across every board EXCEPT ``board``.
+
+    The per-profile cap (``kanban.max_in_progress_per_profile``) protects ONE
+    profile's local model / browser pool / quota — resources the host shares
+    across boards — so a profile already running on another board holds its
+    slot there too. Counting only the dispatching board's rows would let N
+    boards multiply one profile's cap by N, the same host-wide accounting
+    :func:`count_running_tasks_other_boards` already does for the global cap.
+
+    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
+    board to one file) yields ``{}`` — no double counting. Fails open per board.
+    """
+    return _running_tasks_other_boards(board)[1]
 
 
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
@@ -2268,12 +2323,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.capacity_hold = "max_spawn"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.capacity_hold = "max_in_progress"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
@@ -2416,6 +2473,14 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+        # The cap bounds ONE profile's concurrency HOST-wide, exactly like the
+        # global cap bounds host-wide total concurrency: the profile's local
+        # model / browser pool / quota is a host resource shared by every board.
+        # Counting only this board's rows let N boards each grant the profile
+        # its own slot, so a cap of 1 became N (measured live: 2 concurrent
+        # mark workers and 2 concurrent tom workers under a cap of 1).
+        for assignee, n in count_running_tasks_by_assignee_other_boards(board).items():
+            per_profile_running[assignee] = per_profile_running.get(assignee, 0) + n
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold

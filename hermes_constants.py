@@ -994,7 +994,12 @@ def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRAT
     *max_idle_hours*, reaping processes and git worktree registrations rooted in them
     first (``hermes_constants_scratch``); return the count removed. Each removal, each
     kill and each entry rescued mid-prune is recorded in ``<home>/logs/scratch-prune.log``
-    (*scratch* is ``<home>/cache/scratch``)."""
+    (*scratch* is ``<home>/cache/scratch``).
+
+    A ``.no_prune`` marker at the entry's top level or anywhere in its subtree opts the
+    entry out of the prune (sealed artifacts, parked evidence). See
+    :func:`hermes_constants_scratch.prune_idle_entries` for the convention.
+    """
     from hermes_constants_scratch import prune_idle_entries
 
     root = scratch if scratch is not None else get_scratch_dir(prune=False)

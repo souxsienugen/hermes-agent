@@ -18,6 +18,11 @@ import pytest
 
 from hermes_constants import apply_scratch_tmp_env, get_scratch_dir, prune_scratch_dir
 
+# Imported at module scope on purpose: ``pm`` resolves its own location against HERMES_HOME,
+# so once a test redirects HERMES_HOME at a temp dir the ``pm.environments`` submodule can no
+# longer be imported by name. Holding the module object here keeps it patchable per-test.
+import pm.environments as _pm_environments
+
 
 def test_boot_hook_and_prompt_hand_the_prune_to_one_child(scratch_prune_spawns, tmp_path, monkeypatch):
     """The boot hook returns with TMPDIR pointing at a scratch dir that already exists and
@@ -689,6 +694,13 @@ def test_prune_keeps_entry_a_registered_hermes_process_works_in_but_reaps_orphan
     from tools.process_registry import ProcessRegistry
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # v0.23.x resolves the install's runtime venv, launcher dir and store root through the
+    # sealed-payload manifest, which lives in the REAL hermes home. Stub that one lookup so
+    # this test stays isolated from it.
+    monkeypatch.setattr(_pm_environments, "_payload_manifest", lambda *a, **k: None)
+    monkeypatch.setattr(_pm_environments, "runtime_facts_path", lambda *a, **k: tmp_path / "facts.json")
+    monkeypatch.setattr(_pm_environments, "store_root", lambda *a, **k: tmp_path / "store")
+    monkeypatch.setattr(_pm_environments, "runtime_facts_path", lambda *a, **k: tmp_path / "facts.json")
     scratch = get_scratch_dir(tmp_path, prune=False)
     owned_dir, orphan_dir = scratch / "live-worker", scratch / "dead-lane"
     owned_dir.mkdir()
@@ -751,6 +763,13 @@ def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_he
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # v0.23.x resolves the install's runtime venv, launcher dir and store root through the
+    # sealed-payload manifest, which lives in the REAL hermes home. Stub that one lookup so
+    # this test stays isolated from it.
+    monkeypatch.setattr(_pm_environments, "_payload_manifest", lambda *a, **k: None)
+    monkeypatch.setattr(_pm_environments, "runtime_facts_path", lambda *a, **k: tmp_path / "facts.json")
+    monkeypatch.setattr(_pm_environments, "store_root", lambda *a, **k: tmp_path / "store")
+    monkeypatch.setattr(_pm_environments, "runtime_facts_path", lambda *a, **k: tmp_path / "facts.json")
     elsewhere = tmp_path / "other-disk" / "scratch"
     elsewhere.mkdir(parents=True)
     (home / "cache").mkdir()
@@ -790,3 +809,148 @@ def test_prune_owner_lookup_survives_symlinked_scratch_and_drops_orphaned_mcp_he
             helper.kill()
             helper.wait(timeout=10)
 
+
+def test_prune_keeps_entry_with_top_level_no_prune_marker(tmp_path: Path) -> None:
+    """An entry carrying ``.no_prune`` at its root is left untouched even when the
+    tree is otherwise idle, and the audit log records the reason. A sibling entry
+    without the marker is pruned in the same cycle, so the filter does not turn
+    into a blanket skip. Red on pre-fix code: both entries are removed."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    frozen, ordinary = scratch / "frozen-lane", scratch / "ordinary-lane"
+    frozen.mkdir()
+    ordinary.mkdir()
+    (frozen / "sealed.md").write_text("sealed content", encoding="utf-8")
+    (frozen / ".no_prune").write_text("", encoding="utf-8")
+    (ordinary / "stuff.txt").write_text("ordinary", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    # Age every file in the entry — including ``.no_prune`` itself — so the entry
+    # is truly idle. The marker is metadata about retention, not a recent write;
+    # keeping it on its real ``touch`` mtime would let the idleness check carry
+    # the prune and mask the marker filter this test is here to pin.
+    for path in (frozen, frozen / "sealed.md", frozen / ".no_prune",
+                 ordinary, ordinary / "stuff.txt"):
+        os.utime(path, (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 1
+    assert frozen.exists() and (frozen / "sealed.md").read_text(encoding="utf-8") == "sealed content"
+    assert (frozen / ".no_prune").exists()
+    assert not ordinary.exists()
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"kept {str(frozen)!r} \u2014 .no_prune marker present" in log, log
+    assert f"removed {str(ordinary)!r} (" in log, log
+    # Frozen entry must NOT appear as removed in either form.
+    assert f"removed {str(frozen)!r} (" not in log, log
+    assert f"could not fully remove {str(frozen)!r}" not in log, log
+
+
+def test_prune_keeps_entry_with_no_prune_marker_deep_in_subtree(tmp_path: Path) -> None:
+    """A marker nested at any depth in the entry's subtree also opts the whole
+    entry out — the audit log records it once and the entry survives. Carried
+    forward from the carry-forward audit (PFB sealed content park). Red on
+    pre-fix code: top-level-only check is missing."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "parked-evidence"
+    nested = entry / "phase1" / "sealed"
+    nested.mkdir(parents=True)
+    (nested / "anchor").write_text("x", encoding="utf-8")
+    (nested / ".no_prune").write_text("", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for path in (entry, entry / "phase1", nested, nested / "anchor", nested / ".no_prune"):
+        os.utime(path, (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 0
+    assert entry.exists() and nested.exists() and (nested / ".no_prune").exists()
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"kept {str(entry)!r} \u2014 .no_prune marker present" in log, log
+
+
+def test_prune_removes_entry_once_no_prune_marker_is_gone(tmp_path: Path) -> None:
+    """Removing the marker puts the entry back under the ordinary retention rule:
+    no special state lingers after the marker is deleted. Verifies the contract
+    from the docstring (``removing it puts the entry back under the ordinary
+    retention rule``). Red on pre-fix code: the entry has no protection either way;
+    green confirms the marker is the gate, not a stale cached flag."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "thawed"
+    entry.mkdir()
+    (entry / "data").write_text("x", encoding="utf-8")
+    marker = entry / ".no_prune"
+    marker.write_text("", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    # Age everything, including the marker, so the marker is what keeps the entry alive.
+    for path in (entry, entry / "data", marker):
+        os.utime(path, (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 0  # marker present, entry idle → kept
+    assert entry.exists()
+    marker.unlink()
+    # ``unlink`` bumps the directory's mtime — re-age the entry so the removal is the
+    # only thing left to act on, and the second prune sees an idle tree.
+    os.utime(entry, (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 1  # marker gone, ordinary rule applies
+    assert not entry.exists()
+
+
+def test_prune_marker_does_not_follow_symlinks_for_protection(tmp_path: Path) -> None:
+    """A symlink at the entry root is not honored as a folder (matches the existing
+    ``is_dir() and not entry.is_symlink()`` filter for rmtree). A symlinked subdirectory
+    inside the entry does not pull in protection from the link target's ``.no_prune``
+    — same symlink policy as :func:`subtree_touched_since`. Red on pre-fix code:
+    top-level-only check is missing; green confirms both paths."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    # 1. Symlinked entry: marker at the link itself does not protect (the existing
+    #    prune would unlink it, not rmtree it; either way the marker is irrelevant).
+    target = tmp_path / "outside-scratch"
+    target.mkdir()
+    (target / ".no_prune").write_text("", encoding="utf-8")
+    link = scratch / "linked-entry"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink not supported")
+    ancient = time.time() - 30 * 3600
+    # ``os.lstat`` returns the link's own mtime, which is the symlink's own — age it
+    # too, otherwise a freshly-created link is "touched" and never reaches the
+    # marker check.
+    os.utime(link, (ancient, ancient), follow_symlinks=False)
+    os.utime(target, (ancient, ancient))
+    os.utime(target / ".no_prune", (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 1  # unlinked (not protected)
+    assert not link.exists()
+    # 2. Symlinked subdirectory: a marker at the link target is NOT seen by the
+    #    subtree walk; only the link's own subtree counts (and there's nothing else).
+    entry = scratch / "symlinked-subtree"
+    entry.mkdir()
+    outside = tmp_path / "outside-subtree"
+    outside.mkdir()
+    (outside / ".no_prune").write_text("", encoding="utf-8")
+    sub = entry / "linked-sub"
+    sub.symlink_to(outside, target_is_directory=True)
+    # Age the symlink's own mtime so the deep walk doesn't see a recent link creation
+    # and keep the entry alive via the regular touch path.
+    for path in (entry, sub):
+        os.utime(path, (ancient, ancient), follow_symlinks=False)
+        try:
+            os.utime(path, (ancient, ancient))
+        except (OSError, NotImplementedError):
+            pass
+    assert prune_scratch_dir(scratch) == 1  # no real marker reached
+    assert not entry.exists()
+
+
+def test_no_prune_marker_does_not_block_other_entries_in_same_cycle(tmp_path: Path) -> None:
+    """The marker filter must not turn into a blanket skip: an entry with the
+    marker is kept while every sibling idle entry in the same cycle is removed.
+    Green confirms the filter is per-entry, not per-cycle."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    frozen, idle_a, idle_b = scratch / "frozen", scratch / "idle-a", scratch / "idle-b"
+    for entry in (frozen, idle_a, idle_b):
+        entry.mkdir()
+        (entry / "data").write_text("x", encoding="utf-8")
+    (frozen / ".no_prune").write_text("", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for entry in (frozen, idle_a, idle_b):
+        for path in (entry, entry / "data"):
+            os.utime(path, (ancient, ancient))
+    # Also age the marker itself so only the marker (not the touch check) keeps it.
+    os.utime(frozen / ".no_prune", (ancient, ancient))
+    assert prune_scratch_dir(scratch) == 2
+    assert frozen.exists()
+    assert not idle_a.exists() and not idle_b.exists()
