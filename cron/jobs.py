@@ -1867,6 +1867,10 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    # Per-job HARD cap on the run's agent iterations (None = inherit agent.max_turns).
+    # This parameter MUST exist: create_job normalizes with ``raw = locals()`` and then
+    # reads ``raw["max_turns"]`` — without it every create raised KeyError('max_turns').
+    max_turns: Optional[int | str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1940,6 +1944,7 @@ def create_job(
         "monitor_url": f["monitor_url"],
         "monitor_state": None,
         "context_from": f["context_from"],
+        "max_turns": f["max_turns"],
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {"times": repeat, "completed": 0},  # times None = forever

@@ -729,6 +729,10 @@ def _action_create(a: dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
             timezone=_normalize_optional_job_value(a["timezone"]),
             grace_minutes=a["grace_minutes"],
+            # Per-job HARD cap on the run's agent iterations (CLI-only lane, like
+            # reasoning_effort). Without this the cap could only be set post-hoc
+            # through `hermes cron edit`.
+            max_turns=a["max_turns"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             catch_up=a["catch_up"],

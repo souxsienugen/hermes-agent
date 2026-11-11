@@ -15,6 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cron import jobs
 from cron.jobs import _normalize_job_max_turns
 from cron.scheduler import _resolve_cron_agent_setup
 
@@ -30,6 +31,34 @@ class _JC:
 def _setup_for(job, cfg=None):
     cfg = cfg if cfg is not None else {"agent": {"max_turns": 300}}
     return _resolve_cron_agent_setup(job, "job-1", "job-name", _JC(cfg))
+
+
+
+def test_create_job_accepts_and_persists_the_cap(tmp_path, monkeypatch):
+    """``create_job`` must accept ``max_turns``.
+
+    ``create_job`` normalizes with ``raw = locals()`` and then reads
+    ``raw["max_turns"]`` for every key in ``_CREATE_FIELD_NORMALIZERS``. When the
+    parameter was missing from the signature, EVERY create raised
+    ``KeyError('max_turns')`` — cron creation was dead for every job, not just
+    capped ones. The normalizer map, the update path and the scheduler all
+    expected the field to exist.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with jobs.use_cron_store(tmp_path / "cron"):
+        plain = jobs.create_job(prompt="a", schedule="every 1h", deliver="local")
+        assert plain["max_turns"] is None
+
+        capped = jobs.create_job(prompt="b", schedule="every 1h", deliver="local", max_turns=7)
+        assert capped["max_turns"] == 7
+
+        # An empty value clears the cap: the job inherits the fleet-wide budget.
+        cleared = jobs.create_job(prompt="c", schedule="every 1h", deliver="local", max_turns="")
+        assert cleared["max_turns"] is None
+
+        # The stored record keeps it, so a later read resolves the same cap.
+        stored = {j["id"]: j for j in jobs.list_jobs()}
+        assert stored[capped["id"]]["max_turns"] == 7
 
 
 def test_normalizer_accepts_positive_ints_and_clears_on_empty():
