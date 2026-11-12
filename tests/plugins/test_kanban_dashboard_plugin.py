@@ -1367,3 +1367,96 @@ def test_board_payload_exposes_current_run_start_for_every_non_terminal_card(cli
     assert by_id[with_run]["started_at"] == now - 7200
     assert by_id[with_run]["current_run_started_at"] == now - 300
 
+
+# ---------------------------------------------------------------------------
+# The run-start clock is an epoch INT, and the heartbeat gap is one number
+# shared with the engine
+# ---------------------------------------------------------------------------
+
+
+def test_board_payload_current_run_started_at_is_an_epoch_int_not_text(client):
+    """``current_run_started_at`` must reach the frontend as an epoch INT.
+
+    The dashboard's staleness arithmetic is ``now - current_run_started_at``.
+    On a TEXT timestamp that is NaN, ``Math.max(0, NaN)`` is NaN, and every
+    ``age >= tier`` comparison against NaN is false — so the threshold
+    function takes its "not stale" branch and a genuinely stalled card paints
+    GREEN while the engine (which coerces) ages it correctly and reclaims it.
+
+    The value CAN be text: ``task_runs.started_at`` has INTEGER affinity, but
+    SQLite does not reject a non-numeric string in an ``INTEGER NOT NULL``
+    column — it stores it as TEXT — and the legacy in-flight backfill copies
+    ``tasks.started_at`` verbatim.
+
+    So the coercion is asserted at the SOURCE (``kanban_db``) in
+    ``tests/hermes_cli/test_kanban_db.py``; this test pins the end-to-end
+    payload contract, which is what the frontend actually reads.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="text-run", assignee="x")
+        lock = "lock-text-run"
+        future = now + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, lock, future, 99999, t),
+        )
+        # A TEXT timestamp, the shape an outside writer leaves behind.
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (t, lock, future, 99999, "2026-11-12T10:30:00Z"),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    columns = {c["name"]: c for c in r.json()["columns"]}
+    card = next(c for c in columns["running"]["tasks"] if c["id"] == t)
+    # The payload contract is ``number | null`` — never a string, because the
+    # frontend does epoch arithmetic on it.
+    assert isinstance(card["current_run_started_at"], int), card["current_run_started_at"]
+    assert card["current_run_started_at"] == 1794479400, card
+
+
+def test_dashboard_heartbeat_gap_equals_the_engine_constant():
+    """The dashboard's heartbeat gap must EQUAL the engine's.
+
+    The two numbers live in different files — the dashboard bundle's
+    ``STALE_HEARTBEAT_GAP_SECONDS`` and
+    ``hermes_cli.kanban_db_dispatch._STALE_HEARTBEAT_GAP_SECONDS`` — and
+    nothing tied them together. Drift in either direction is silent: the
+    board would stop agreeing with the engine about when a silent worker is
+    stale, which is the exact disagreement this change exists to kill.
+
+    The bundle has no build step, so the constant is read out of the shipped
+    file by the probe (``--print-constants``), not from a source module.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    probe = Path(__file__).parent / "fixtures" / "kanban_staleness_probe.js"
+    result = subprocess.run(
+        [node, str(probe), str(bundle), "--print-constants"],
+        capture_output=True, text=True, timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    reported = json.loads(result.stdout.strip())
+    bundle_gap = reported["stale_heartbeat_gap_seconds"]
+
+    from hermes_cli.kanban_db_dispatch import _STALE_HEARTBEAT_GAP_SECONDS
+
+    assert bundle_gap == _STALE_HEARTBEAT_GAP_SECONDS, (
+        f"dashboard heartbeat gap {bundle_gap!r} != engine "
+        f"{_STALE_HEARTBEAT_GAP_SECONDS!r}"
+    )
+
+
