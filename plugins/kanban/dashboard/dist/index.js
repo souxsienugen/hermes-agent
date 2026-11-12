@@ -3106,14 +3106,71 @@
     todo:    { amber: 7 * 24 * 60 * 60, red: 30 * 24 * 60 * 60 },
   };
 
+  // A running card only counts as STALLED once its worker has gone quiet for
+  // this long — the same gap the dispatcher reclaims a run on
+  // (hermes_cli/kanban_db_dispatch._STALE_HEARTBEAT_GAP_SECONDS). Without it a
+  // healthy long-running worker would still paint red, so the board would
+  // keep crying wolf on cards the engine is happily running.
+  const STALE_HEARTBEAT_GAP_SECONDS = 60 * 60;
+
+  // The payload's own server clock, recovered from the card's age metrics
+  // (age.*_age_seconds is the server's now minus the matching timestamp).
+  // Using it instead of the browser clock keeps the verdict identical on
+  // every client and immune to browser clock skew.
+  function payloadNowSeconds(task) {
+    if (!task || !task.age) return null;
+    const age = task.age;
+    if (task.started_at != null && age.started_age_seconds != null) {
+      return task.started_at + age.started_age_seconds;
+    }
+    if (task.created_at != null && age.created_age_seconds != null) {
+      return task.created_at + age.created_age_seconds;
+    }
+    return null;
+  }
+
+  // Age of the card's CURRENT run, in seconds. The task's own started_at is
+  // the FIRST-EVER start and is never reset on re-dispatch (the claim path
+  // writes COALESCE(started_at, ?)), so it kept ageing forever across
+  // retries. current_run_started_at is the live run's start, so the run clock
+  // ticks from the current attempt. Cards with no live run fall back to the
+  // first-ever age.
+  function currentRunAgeSeconds(task, now) {
+    if (task.current_run_started_at == null) {
+      // No live run to age from: the first-ever start is all we have.
+      return task.age.started_age_seconds;
+    }
+    // A live run exists — age from IT. Never fall back to the first-ever
+    // start here: that is the bug this fixes (a re-dispatched card kept
+    // ageing across retries and stayed red while its worker was healthy).
+    if (now == null) return null;
+    return Math.max(0, now - task.current_run_started_at);
+  }
+
+  // True while the worker is still reporting in. Mirrors the dispatcher: a
+  // run with a recent heartbeat is alive, so it is not a stall.
+  function workerReporting(task, now) {
+    if (task.last_heartbeat_at == null || now == null) return false;
+    return (now - task.last_heartbeat_at) < STALE_HEARTBEAT_GAP_SECONDS;
+  }
+
   function stalenessClass(task) {
     if (!task || !task.age) return "";
-    const age = task.status === "running"
-      ? task.age.started_age_seconds
-      : task.age.created_age_seconds;
     const tier = STALENESS[task.status];
-    if (!tier || age == null) return "";
-    if (age >= tier.red)   return "hermes-kanban-card--stale-red";
+    if (!tier) return "";
+    const now = payloadNowSeconds(task);
+    const age = task.status === "running"
+      ? currentRunAgeSeconds(task, now)
+      : task.age.created_age_seconds;
+    if (age == null) return "";
+    if (age >= tier.red) {
+      // Running cards go red only when the worker has actually stopped
+      // reporting — the same two conditions the dispatcher reclaims on (run
+      // age AND heartbeat). A healthy worker on a long run stays amber.
+      if (task.status !== "running" || !workerReporting(task, now)) {
+        return "hermes-kanban-card--stale-red";
+      }
+    }
     if (age >= tier.amber) return "hermes-kanban-card--stale-amber";
     return "";
   }
