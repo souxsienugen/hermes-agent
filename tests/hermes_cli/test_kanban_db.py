@@ -2082,3 +2082,96 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# current_run_started_ats() — coerce the run start to an epoch int
+# ---------------------------------------------------------------------------
+# ``task_runs.started_at`` is declared ``INTEGER NOT NULL``, but SQLite's
+# INTEGER affinity does NOT reject a non-numeric string: it stores it as
+# TEXT (verified: ``typeof(started_at) == 'text'``). Outside writers do leave
+# text timestamps behind — the legacy in-flight backfill in
+# ``hermes_cli/kanban_db_connect`` copies ``tasks.started_at`` verbatim.
+#
+# Every consumer of this value does epoch arithmetic on it: the dashboard
+# computes ``now - current_run_started_at``. On a text timestamp that
+# arithmetic is NaN, ``Math.max(0, NaN)`` is NaN, and every ``age >= tier``
+# comparison against NaN is false — so the threshold function takes its "not
+# stale" branch and a genuinely stalled card paints GREEN while the engine
+# (which coerces, at ``kanban_db_dispatch.detect_stale_running``) ages it
+# correctly and reclaims it. The board and the engine then disagree in the
+# OPPOSITE direction from the bug this column was fixed for.
+
+
+def _run_row(conn, task_id, started_at):
+    """Insert a task_runs row with a raw ``started_at`` value (no coercion:
+    the point of these tests is what the READ path does with it)."""
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, 'running', ?)",
+        (task_id, started_at),
+    )
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+    return run_id
+
+
+def test_current_run_started_ats_coerces_text_timestamp_to_epoch_int(kanban_home):
+    """A TEXT ``task_runs.started_at`` must reach the caller as an epoch int.
+
+    The dashboard's staleness arithmetic assumes an int; a text timestamp
+    makes it NaN and paints a stalled card green (see the section comment
+    above). The coercion happens at the SOURCE so every consumer — the
+    dashboard bundle, the desktop app, the detail endpoints — benefits.
+    """
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="text-run", assignee="a")
+        # An ISO-8601 string, the shape an outside writer leaves behind.
+        _run_row(conn, t, "2026-11-12T10:30:00Z")
+
+        # The column really does hold TEXT (SQLite keeps a non-numeric string
+        # in an INTEGER column) — otherwise this test would be vacuous.
+        stored = conn.execute(
+            "SELECT typeof(started_at) FROM task_runs WHERE task_id=?", (t,),
+        ).fetchone()[0]
+        assert stored == "text", stored
+
+        got = kb.current_run_started_ats(conn, [t])
+        assert got[t] == 1794479400, got
+        assert isinstance(got[t], int), type(got[t])
+
+
+def test_current_run_started_ats_coerces_numeric_text_to_epoch_int(kanban_home):
+    """A numeric string is coerced to an int too — the payload contract is
+    ``number | null``, never a string."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="numeric-text-run", assignee="a")
+        _run_row(conn, t, "1794479400")
+
+        got = kb.current_run_started_ats(conn, [t])
+        assert got[t] == 1794479400, got
+        assert isinstance(got[t], int), type(got[t])
+
+
+def test_current_run_started_ats_leaves_int_started_at_unchanged(kanban_home):
+    """The normal case — an INTEGER epoch — is passed through unchanged."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="int-run", assignee="a")
+        _run_row(conn, t, 1794479400)
+
+        got = kb.current_run_started_ats(conn, [t])
+        assert got[t] == 1794479400, got
+        assert isinstance(got[t], int), type(got[t])
+
+
+def test_current_run_started_ats_yields_none_for_unreadable_timestamp(kanban_home):
+    """An unreadable timestamp yields None (no usable run clock) rather than a
+    string — the payload contract is ``number | null``. The dashboard's
+    fallback for a null run start is the card's first-ever age, which is a
+    number, so no NaN can reach the threshold function."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="garbage-run", assignee="a")
+        _run_row(conn, t, "not-a-timestamp")
+
+        got = kb.current_run_started_ats(conn, [t])
+        assert got[t] is None, got
+
