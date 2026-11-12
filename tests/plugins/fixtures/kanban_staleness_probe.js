@@ -28,11 +28,14 @@ const src = fs.readFileSync(bundlePath, "utf8");
 // back to their pre-fix semantics (first-ever age, no heartbeat gate) and
 // let the behavioural checks below decide pass/fail.
 function extractFunction(name, required) {
-  const start = src.indexOf("function " + name);
-  if (start === -1) {
+  // Anchor the name: a bare prefix match would happily extract a
+  // same-prefix sibling (`stalenessClassOf`) defined earlier in the bundle.
+  const match = new RegExp("\\bfunction\\s+" + name + "\\s*\\(").exec(src);
+  if (!match) {
     if (required) { console.error(name + " not found in bundle"); process.exit(1); }
     return null;
   }
+  const start = match.index;
   const bodyStart = src.indexOf("{", start);
   let depth = 0, end = bodyStart;
   for (; end < src.length; end++) {
@@ -53,11 +56,14 @@ function extractFunction(name, required) {
 // expression (match to the terminating `;`). Bracket-matching a simple
 // expression would run past it into unrelated later code.
 function extractConst(name, required) {
-  const start = src.indexOf("const " + name + " =");
-  if (start === -1) {
+  // Anchored for the same reason as extractFunction: a bare prefix match
+  // could pick up a same-prefix sibling constant.
+  const match = new RegExp("\\bconst\\s+" + name + "\\s*=").exec(src);
+  if (!match) {
     if (required) { console.error(name + " not found in bundle"); process.exit(1); }
     return null;
   }
+  const start = match.index;
   const valueStart = src.indexOf("=", start) + 1;
   const rest = src.slice(valueStart);
   const firstChar = (rest.match(/[^\s]/) || [""])[0];
@@ -81,6 +87,29 @@ function extractConst(name, required) {
 }
 
 const heartbeatGapSrc = extractConst("STALE_HEARTBEAT_GAP_SECONDS", false);
+
+// Evaluate a `const X = <expr>;` snippet and return X's value (null when the
+// snippet cannot be evaluated). Used to report the constant the bundle
+// DECLARES, so the Python suite can compare it against the engine's own.
+function evalConst(srcText, name) {
+  try {
+    return new Function(srcText + "\nreturn " + name + ";")();
+  } catch (e) {
+    return null;
+  }
+}
+
+// `--print-constants` reports the bundle's declared heartbeat gap as JSON and
+// exits. The Python suite uses it to pin the bundle's constant against the
+// engine's `_STALE_HEARTBEAT_GAP_SECONDS` — the two live in different files
+// and nothing else ties them together.
+if (process.argv[3] === "--print-constants") {
+  const declared = heartbeatGapSrc
+    ? evalConst(heartbeatGapSrc, "STALE_HEARTBEAT_GAP_SECONDS")
+    : null;
+  process.stdout.write(JSON.stringify({ stale_heartbeat_gap_seconds: declared }) + "\n");
+  process.exit(0);
+}
 
 // Pre-fix fallbacks for a bundle that predates the fix: the age came from the
 // first-ever start and no heartbeat gate existed. They are only reached when
@@ -111,6 +140,18 @@ function check(label, actual, expected) {
   failures++;
   console.error("FAIL: " + label + " -> expected " + JSON.stringify(expected) + ", got " + JSON.stringify(actual));
 }
+
+// --- The heartbeat gap is a number shared with the engine -----------------
+// The stale-heartbeat fixture below is built FROM this constant, so without
+// this assertion a changed bundle value would silently rescale every fixture
+// and the probe would still PASS — the probe could not detect drift in the
+// very constant it derives its own expectations from.
+//
+// The engine's copy of the same number lives in
+// hermes_cli/kanban_db_dispatch.py (_STALE_HEARTBEAT_GAP_SECONDS). The Python
+// suite pins the bundle's value against the engine's, so this literal and the
+// engine's value must agree; changing either one alone fails a test.
+check("heartbeat gap constant matches the engine's 3600s", STALE_HEARTBEAT_GAP_SECONDS, 3600);
 
 // Build a card shaped exactly like the backend's _task_dict output.
 // startedAt is the FIRST-EVER start; runStart is the CURRENT run's start
