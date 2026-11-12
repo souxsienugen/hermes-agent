@@ -1259,3 +1259,111 @@ def test_ws_events_for_archived_board_does_not_recreate_it(tmp_path, monkeypatch
         "/api/plugins/kanban/events?token=secret-xyz&board=alive"
     ) as ws:
         assert ws is not None
+
+
+# ---------------------------------------------------------------------------
+# Running-card staleness clock: current run, not first-ever start
+# ---------------------------------------------------------------------------
+
+
+def test_running_card_staleness_uses_current_run_not_first_ever_start():
+    """A re-dispatched running card must be aged from its CURRENT run.
+
+    ``tasks.started_at`` is the FIRST-EVER start and is never reset on
+    re-dispatch (the claim path writes ``COALESCE(started_at, ?)``), so
+    colouring running cards from ``age.started_age_seconds`` kept a card
+    red/amber forever across retries — the board disagreed with the engine,
+    which ages a run from ``task_runs.started_at``.
+
+    The board must also agree with the dispatcher's own stall rule
+    (``detect_stale_running``): a run is stale only when it is BOTH long and
+    silent, so a healthy worker on a long run is amber, not red.
+
+    The bundle has no build step, so this drives the real shipped functions
+    (extracted verbatim, not regex-matched) with card payloads shaped like
+    the backend's ``_task_dict`` output — behavioral, not a source-text pin.
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not available")
+    bundle = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    probe = Path(__file__).parent / "fixtures" / "kanban_staleness_probe.js"
+    result = subprocess.run(
+        [node, str(probe), str(bundle)],
+        capture_output=True, text=True, timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "PASS" in result.stdout
+
+
+def test_board_payload_exposes_current_run_start_for_every_non_terminal_card(client):
+    """AC4: the backend must expose ``current_run_started_at`` for every
+    non-terminal card, so the frontend can age each card from its live run.
+
+    Before this contract the key did not exist at all; without it on every
+    card the frontend has no way to know the current attempt's start and
+    falls back to the first-ever age.
+
+    ``test_board_card_exposes_current_run_start`` above pins the VALUE on a
+    running card and on a never-claimed one. This test pins the other half of
+    the contract: the key is present on EVERY non-terminal column, not just
+    the two that one exercises. A card in ``todo``/``blocked``/``review`` that
+    silently lacked the key would make the frontend fall back to the
+    first-ever age for that column.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        # One card per non-terminal column, so each column's cards are covered.
+        ids = {}
+        for status in ("triage", "todo", "scheduled", "ready", "blocked", "review"):
+            tid = kb.create_task(conn, title=f"in-{status}", assignee="x")
+            conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, tid))
+            ids[status] = tid
+        # A running card WITH a live run: the key must be the CURRENT run's
+        # start, not the task's first-ever start.
+        with_run = kb.create_task(conn, title="with-run", assignee="x")
+        lock = "lock-staleness"
+        future = now + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, lock, future, 99999, with_run),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (with_run, lock, future, 99999, now - 300),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, with_run))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    columns = {c["name"]: c for c in r.json()["columns"]}
+    by_id = {c["id"]: c for col in columns.values() for c in col["tasks"]}
+
+    # Every non-terminal card carries the key, so the frontend can always age
+    # it from its live run (null when the card has no run).
+    for card in by_id.values():
+        if card["status"] in ("done", "archived"):
+            continue
+        assert "current_run_started_at" in card, card["id"]
+
+    # Each non-terminal column's card is present on the board and carries the
+    # key — the frontend ages every one of them from it.
+    for status, tid in ids.items():
+        assert tid in by_id, f"{status} card missing from the board"
+        assert "current_run_started_at" in by_id[tid], status
+        # A card with no live run has no run start: the key is present, null.
+        assert by_id[tid]["current_run_started_at"] is None, status
+
+    # The running card's key is the CURRENT run's start, not the task's
+    # first-ever start — the whole point of the run clock.
+    assert by_id[with_run]["started_at"] == now - 7200
+    assert by_id[with_run]["current_run_started_at"] == now - 300
+
