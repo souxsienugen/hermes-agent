@@ -4178,9 +4178,19 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
     return {r["task_id"]: r["summary"] for r in rows}
 
 
-def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, int]:
+def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[str, Optional[int]]:
     """``{task_id: started_at of the run ``tasks.current_run_id`` points at}``
-    in one query; tasks with no active run (NULL or dangling pointer) are omitted."""
+    in one query; tasks with no active run (NULL or dangling pointer) are omitted.
+
+    ``started_at`` is coerced to an epoch int (``_to_epoch``): the column has
+    INTEGER affinity, but SQLite stores a non-numeric text value as TEXT, and
+    outside writers do leave text timestamps behind (the legacy in-flight
+    backfill in ``kanban_db_connect`` copies ``tasks.started_at`` verbatim).
+    Every consumer of this value does epoch arithmetic on it — the dashboard
+    computes ``now - current_run_started_at`` — and on a text timestamp that
+    arithmetic is NaN, which silently paints a stalled card as NOT stale.
+    A value that is not a readable timestamp yields None (no usable run clock).
+    """
     ids = list(task_ids)
     if not ids:
         return {}
@@ -4191,7 +4201,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
         f"WHERE t.id IN ({placeholders})",
         ids,
     ).fetchall()
-    return {r["task_id"]: r["started_at"] for r in rows}
+    return {r["task_id"]: _to_epoch(r["started_at"]) for r in rows}
 
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
