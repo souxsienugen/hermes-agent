@@ -2141,11 +2141,27 @@ def test_current_run_started_ats_coerces_text_timestamp_to_epoch_int(kanban_home
 
 
 def test_current_run_started_ats_coerces_numeric_text_to_epoch_int(kanban_home):
-    """A numeric string is coerced to an int too — the payload contract is
-    ``number | null``, never a string."""
+    """A numeric string stored as TEXT is coerced to an int too — the payload
+    contract is ``number | null``, never a string.
+
+    The value carries PEP 515 digit separators (``1_794_479_400``) on purpose.
+    SQLite's INTEGER affinity converts a WELL-FORMED numeric literal to
+    INTEGER at INSERT time, so a plain ``'1794479400'`` never reaches the
+    read path as TEXT — the assertion below would then hold even with the
+    coercion reverted, i.e. the test would be vacuous. ``int()`` accepts the
+    separators, so ``_to_epoch`` really does have to parse this string to
+    produce the epoch.
+    """
     with kbc.connect() as conn:
         t = kb.create_task(conn, title="numeric-text-run", assignee="a")
-        _run_row(conn, t, "1794479400")
+        _run_row(conn, t, "1_794_479_400")
+
+        # The column really does hold TEXT — otherwise this test would be
+        # vacuous (SQLite converts a well-formed numeric literal to INTEGER).
+        stored = conn.execute(
+            "SELECT typeof(started_at) FROM task_runs WHERE task_id=?", (t,),
+        ).fetchone()[0]
+        assert stored == "text", stored
 
         got = kb.current_run_started_ats(conn, [t])
         assert got[t] == 1794479400, got
