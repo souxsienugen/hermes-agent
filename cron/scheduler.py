@@ -285,6 +285,16 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
         return inactivity_notice(job_name, job_id)
 
+    # A provider quota wall kills the agent turn before it can report anything:
+    # the monitoring lane goes BLIND, not merely noisy. Say so in those words,
+    # before the generic provider copy re-diagnoses it as a transient hiccup.
+    if not job.get("no_agent"):
+        from cron.provider_wall import provider_wall_failure_notice
+
+        wall_notice = provider_wall_failure_notice(job_name, job_id, text)
+        if wall_notice:
+            return wall_notice
+
     # no_agent jobs never reach a model, so provider errors are structurally impossible for them:
     # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
     # blame the wrong subsystem.
@@ -2627,6 +2637,17 @@ def run_job(
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
             # agent-declared failure marker keep their first-line/whole-response contract.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
+        # A blind window (provider wall) closes here: the job produced a report
+        # again, so say how long the lane was dark before the operator reads it.
+        if final_response.strip():
+            try:
+                from cron.provider_wall import provider_wall_recovery_notice
+
+                recovery_notice = provider_wall_recovery_notice(job_id)
+                if recovery_notice:
+                    final_response = f"{recovery_notice}\n\n{final_response}"
+            except Exception:
+                logger.debug("Job '%s': provider-wall recovery bookkeeping failed", job_id)
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         # Text-file reads normalize newlines; count the same characters the
@@ -2645,6 +2666,17 @@ def run_job(
     except (Exception, ConfigBackendUnavailable) as e:  # the plane being down fails THIS fire only
         error_msg = f"{type(e).__name__}: {e!s}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # A provider wall is not a silent no-op: the turn died before the job
+        # could report anything, so count the blind fire. The count is what
+        # turns the next delivery into "monitoring was blind for N fires"
+        # instead of a bare error the operator reads as noise.
+        try:
+            from cron.provider_wall import is_provider_wall_failure, record_blind_fire
+
+            if is_provider_wall_failure(error_msg):
+                record_blind_fire(job_id, error_msg)
+        except Exception:
+            logger.debug("Job '%s': provider-wall bookkeeping failed", job_id)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
         # tail can schedule a bounded automatic re-run instead of waiting a full period.
