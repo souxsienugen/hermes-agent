@@ -105,18 +105,37 @@ def test_a_broken_probe_fails_open(kanban_home, monkeypatch):
         assert kbd._provider_wall_is_up() is False
 
 
-def test_the_gate_reads_the_live_wall_not_the_timer(kanban_home, monkeypatch):
-    """The gate's own contract: it asks the shared live reading."""
+def _publish_wall_state(root, state: str, *, age_seconds: int = 0) -> None:
+    """Publish a reading the shipped code will pick up (no probe, no monkeypatch).
+
+    The dispatcher and the archive guard read the wall through the SHARED state
+    file, so a test writes the same file the live probe writes. That keeps the
+    test honest (it exercises the real read path) and free of any dependency on
+    which module object a late import resolves to.
+    """
+    kpw.write_wall_state(
+        root,
+        {
+            "provider": "minimax-oauth",
+            "state": state,
+            "checked_at": int(time.time()) - age_seconds,
+        },
+    )
+
+
+def test_the_gate_reads_the_live_wall_not_the_timer(kanban_home):
+    """The gate asks the shared live reading, not the cooldown timer."""
     calls = []
 
     def _fake_live_state(**kwargs):
         calls.append(kwargs)
         return {"state": kpw.WALL_UP, "source": "live"}
 
-    monkeypatch.setattr(kpw, "live_wall_state", _fake_live_state)
-    monkeypatch.setattr(kpw, "provider_wall_root", lambda: kanban_home)
+    # The reading is published where the shipped code looks for it.
+    _publish_wall_state(kanban_home, kpw.WALL_UP)
     assert kbd._provider_wall_is_up() is True
-    assert calls and "root" in calls[0]
+    assert kpw.read_wall_state(kanban_home)["minimax-oauth"]["state"] == kpw.WALL_UP
+    assert calls == []  # a fresh reading needs no probe
 
 
 # ---------------------------------------------------------------------------
@@ -144,20 +163,14 @@ def test_the_same_card_is_archivable_once_its_cooldown_has_elapsed(kanban_home, 
         task_id = _card(conn, "PROVIDER: MiniMax 2067 wall tracker")
         _rate_limited_run(conn, task_id, int(time.time()) - 3601)
         # The wall is down, so the class rule does not refuse either.
-        monkeypatch.setattr(
-            kpw, "live_wall_state",
-            lambda **kw: {"state": kpw.WALL_DOWN, "source": "live"},
-        )
+        _publish_wall_state(kanban_home, kpw.WALL_DOWN)
         assert kb_cli._provider_wall_archive_refusal(conn, task_id) is None
         assert kb_cli._archive_one(conn, task_id) is True
 
 
-def test_a_provider_tracker_may_not_be_archived_while_the_wall_is_up(kanban_home, monkeypatch):
+def test_a_provider_tracker_may_not_be_archived_while_the_wall_is_up(kanban_home):
     """Archiving the only tracker of a live defect is what created this card."""
-    monkeypatch.setattr(
-        kpw, "live_wall_state",
-        lambda **kw: {"state": kpw.WALL_UP, "source": "live", "detail": "429"},
-    )
+    _publish_wall_state(kanban_home, kpw.WALL_UP)
     with kbc.connect() as conn:
         task_id = _card(conn, "PROVIDER: MiniMax 2067 wall re-armed and blinded the sweep")
         refusal = kb_cli._provider_wall_archive_refusal(conn, task_id)
@@ -166,23 +179,17 @@ def test_a_provider_tracker_may_not_be_archived_while_the_wall_is_up(kanban_home
         assert kb_cli._archive_one(conn, task_id) is False
 
 
-def test_an_ordinary_card_is_unaffected(kanban_home, monkeypatch):
-    monkeypatch.setattr(
-        kpw, "live_wall_state",
-        lambda **kw: {"state": kpw.WALL_UP, "source": "live"},
-    )
+def test_an_ordinary_card_is_unaffected(kanban_home):
+    _publish_wall_state(kanban_home, kpw.WALL_UP)
     with kbc.connect() as conn:
         task_id = _card(conn, "ordinary work card", body="implement the thing")
         assert kb_cli._provider_wall_archive_refusal(conn, task_id) is None
         assert kb_cli._archive_one(conn, task_id) is True
 
 
-def test_the_db_layer_guard_covers_every_archive_path(kanban_home, monkeypatch):
+def test_the_db_layer_guard_covers_every_archive_path(kanban_home):
     """The dashboard's PATCH/bulk routes call ``kb.archive_task`` directly."""
-    monkeypatch.setattr(
-        kpw, "live_wall_state",
-        lambda **kw: {"state": kpw.WALL_UP, "source": "live"},
-    )
+    _publish_wall_state(kanban_home, kpw.WALL_UP)
     with kbc.connect() as conn:
         task_id = _card(conn, "PROVIDER: MiniMax 2067 wall tracker")
         assert kb.archive_task(conn, task_id) is False
