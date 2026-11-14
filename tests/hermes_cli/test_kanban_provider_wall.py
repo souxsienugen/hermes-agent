@@ -206,5 +206,15 @@ def test_a_429_from_the_probe_is_classified_as_a_wall(monkeypatch):
     assert reading["status"] == 429
 
 
+def test_the_freshness_window_is_configurable(monkeypatch):
+    """The operator can tighten (or widen) the window without a code change."""
+    monkeypatch.setenv("HERMES_KANBAN_PROVIDER_WALL_MAX_AGE_SECONDS", "45")
+    assert kpw.resolve_max_age_seconds() == 45
+    monkeypatch.setenv("HERMES_KANBAN_PROVIDER_WALL_MAX_AGE_SECONDS", "not-a-number")
+    assert kpw.resolve_max_age_seconds() == kpw.DEFAULT_MAX_AGE_SECONDS
+    monkeypatch.delenv("HERMES_KANBAN_PROVIDER_WALL_MAX_AGE_SECONDS")
+    assert kpw.resolve_max_age_seconds() == kpw.DEFAULT_MAX_AGE_SECONDS
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

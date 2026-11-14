@@ -40,9 +40,11 @@ WALL_UNKNOWN = "unknown"
 
 # A reading older than this is not evidence about "right now": the card warns
 # that a wall-down measurement taken too early was true when written and false
-# twelve minutes later. Keep the window short enough that a stale DOWN cannot
-# re-admit a card into a wall that re-armed in the meantime.
-DEFAULT_MAX_AGE_SECONDS = 30
+# twelve minutes later. The window is short enough that a stale DOWN cannot
+# re-admit a card into a wall that re-armed in the meantime, and long enough
+# that the 16 per-board dispatchers share ONE probe per tick instead of one
+# probe each. Override with ``HERMES_KANBAN_PROVIDER_WALL_MAX_AGE_SECONDS``.
+DEFAULT_MAX_AGE_SECONDS = 120
 
 DEFAULT_TIMEOUT_SECONDS = 20.0
 
@@ -212,12 +214,25 @@ def write_wall_state(root: Path | str, reading: dict[str, Any]) -> None:
         pass
 
 
+def resolve_max_age_seconds() -> int:
+    """How long a shared reading stays usable (``HERMES_KANBAN_PROVIDER_WALL_MAX_AGE_SECONDS``)."""
+    raw = os.environ.get("HERMES_KANBAN_PROVIDER_WALL_MAX_AGE_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+    return DEFAULT_MAX_AGE_SECONDS
+
+
 def live_wall_state(
     *,
     root: Path | str,
     provider: str = "minimax-oauth",
     model: Optional[str] = None,
-    max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
+    max_age_seconds: Optional[int] = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     now: Optional[float] = None,
 ) -> dict[str, Any]:
@@ -229,6 +244,8 @@ def live_wall_state(
     stale measurement.
     """
     now = int(now if now is not None else time.time())
+    if max_age_seconds is None:
+        max_age_seconds = resolve_max_age_seconds()
     cached = read_wall_state(root).get(provider)
     if isinstance(cached, dict):
         try:
