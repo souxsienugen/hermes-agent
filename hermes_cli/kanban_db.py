@@ -3786,6 +3786,80 @@ def specify_triage_task(
     return True
 
 
+# A card in the provider-wall class: its title/body names the wall itself.
+_PROVIDER_WALL_CARD_RE = re.compile(
+    r"(?i)(\b2067\b|token[ -]plan usage limit|provider wall|quota wall|"
+    r"rate[ -]limit wall|token plan wall|token-plan wall)",
+)
+
+
+def provider_wall_archive_refusal(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Why this card must not be archived right now, or ``None``.
+
+    Two refusals, both about the same defect class (the provider quota wall):
+
+    1. The card's own last run died on a quota wall (HTTP 429 / 2067) and that
+       death is still inside the rate-limit cooldown. Such a card is not
+       resolved — its work never happened.
+    2. The card tracks the provider wall and the wall is measurably UP right
+       now. Archiving it then removes the only owner of a live defect.
+
+    The 2026-11-13 06:29:43 ET archive of ``t_4b4735f7`` is exactly what this
+    refuses: the wall had re-armed at 06:19:55 ET and that card's own final
+    worker run died on 2067 at 06:19:45 ET — ten minutes before it was
+    archived as resolved, which is why the recurrence went unowned for 3.5
+    hours.
+
+    The live probe is fail-open: an unreadable state file, a missing
+    credential or an unclassifiable answer all read as "not a measurable wall",
+    so a broken probe can never block an archive.
+    """
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+
+    now = int(time.time())
+    cooldown = _resolve_rate_limit_cooldown_seconds()
+    latest = conn.execute(
+        "SELECT outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["outcome"] == "rate_limited":
+        ended_at = _to_epoch(latest["ended_at"])
+        if ended_at is not None and cooldown > 0 and (now - ended_at) < cooldown:
+            return (
+                f"its worker run died on the provider wall {now - ended_at}s ago "
+                f"(inside the {cooldown}s rate-limit cooldown) — a card that died on a "
+                "quota wall is not resolved; archive it once the cooldown has elapsed "
+                "and the wall is down"
+            )
+
+    text = f"{row['title'] or ''}\n{row['body'] or ''}"
+    if not _PROVIDER_WALL_CARD_RE.search(text):
+        return None
+    try:
+        from hermes_cli import kanban_provider_wall as kpw
+
+        root = kpw.provider_wall_root()
+        if root is None:
+            return None
+        reading = kpw.live_wall_state(root=root, timeout=8.0)
+    except Exception:
+        return None
+    if reading.get("state") == kpw.WALL_UP:
+        detail = reading.get("detail") or reading.get("status") or "no detail"
+        return (
+            f"the provider wall is measurably UP right now ({detail}) — archiving a "
+            "provider tracker while the defect it tracks is live removes the only "
+            "owner of that defect"
+        )
+    return None
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
     """Archive a task; a *running* task's host-local worker is terminated.
 
@@ -3797,9 +3871,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
     lock. Post-release kill is safe here because ``archived`` is terminal: no
     dispatcher can spawn a duplicate worker off the released claim. The
-    termination outcome lands as its own ``archive_worker_termination`` event so
-    the ``archived`` event stays atomic with the status flip.
+    termination outcome lands as its own ``archive_worker_termination`` event so the
+    ``archived`` event stays atomic with the status flip.
+
+    A card that died on the provider quota wall (or a provider tracker whose
+    defect is still live) is refused: it is not resolved, and archiving it
+    removes the only owner of the defect. The check runs BEFORE the write
+    transaction so the live probe never holds the DB write lock.
     """
+    if provider_wall_archive_refusal(conn, task_id) is not None:
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",

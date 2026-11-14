@@ -177,5 +177,28 @@ def test_an_ordinary_card_is_unaffected(kanban_home, monkeypatch):
         assert kb_cli._archive_one(conn, task_id) is True
 
 
+def test_the_db_layer_guard_covers_every_archive_path(kanban_home, monkeypatch):
+    """The dashboard's PATCH/bulk routes call ``kb.archive_task`` directly."""
+    monkeypatch.setattr(
+        kpw, "live_wall_state",
+        lambda **kw: {"state": kpw.WALL_UP, "source": "live"},
+    )
+    with kbc.connect() as conn:
+        task_id = _card(conn, "PROVIDER: MiniMax 2067 wall tracker")
+        assert kb.archive_task(conn, task_id) is False
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["status"] != "archived"
+
+
+def test_a_card_that_died_on_the_wall_is_not_closable_at_all(kanban_home):
+    """Not even as an ordinary card: its work never happened."""
+    with kbc.connect() as conn:
+        task_id = _card(conn, "ordinary work card")
+        _rate_limited_run(conn, task_id, int(time.time()) - 60)
+        assert kb.archive_task(conn, task_id) is False
+        row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        assert row["status"] != "archived"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
