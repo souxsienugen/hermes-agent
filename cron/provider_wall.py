@@ -124,10 +124,13 @@ def provider_wall_failure_notice(
 ) -> Optional[str]:
     """The delivery copy for a cron fire that died on the provider wall.
 
-    ``None`` when the failure is not a provider wall (the caller keeps its
-    ordinary failure copy).
+    ``None`` when the failure is not the token-plan wall (the caller keeps its
+    ordinary failure copy). The scope is deliberately narrow: a generic
+    "HTTP 429: Too Many Requests" from another provider is a transient hiccup
+    with an established, correct copy, while the token-plan wall (2067) kills
+    the turn outright and leaves the monitoring lane with nothing at all.
     """
-    if not is_provider_wall_failure(error):
+    if not is_token_plan_wall(error):
         return None
     now = int(now if now is not None else time.time())
     entry = blind_state(job_id)

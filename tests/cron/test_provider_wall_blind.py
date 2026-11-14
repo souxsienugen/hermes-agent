@@ -103,6 +103,19 @@ def test_a_non_wall_failure_has_no_wall_notice(cron_home):
     assert cpw.provider_wall_failure_notice("job", "job1", "script timed out") is None
 
 
+def test_a_generic_429_keeps_the_existing_rate_limit_copy(cron_home):
+    """A plain 429 from another provider is a hiccup, not this defect class.
+
+    The wall copy is scoped to the token-plan wall (2067) so the established
+    rate-limit copy keeps its contract for every other provider.
+    """
+    plain = "HTTP 429: Too Many Requests"
+    # It still counts as a blind fire (the turn died, the lane produced nothing).
+    assert cpw.is_provider_wall_failure(plain) is True
+    # But the delivery keeps the existing, correct wording.
+    assert cpw.provider_wall_failure_notice("job", "job1", plain) is None
+
+
 def test_the_recovery_notice_closes_the_blind_window(cron_home):
     cpw.record_blind_fire("job1", WALL_ERROR)
     cpw.record_blind_fire("job1", WALL_ERROR)
