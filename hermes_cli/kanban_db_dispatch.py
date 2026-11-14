@@ -1571,6 +1571,29 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _provider_wall_is_up() -> bool:
+    """True only when the provider wall is measurably UP right now.
+
+    This is the LIVE half of the rate-limit cooldown: the cooldown says "a
+    worker died on a quota wall an hour ago", this says "the provider is
+    refusing calls right now". The probe is fail-open by construction — a
+    missing credential, an unreachable provider, an unreadable state file or
+    an unclassifiable answer all read as "not a measurable wall", so a broken
+    probe can never strand the fleet. Only a positive "up" verdict holds a
+    card back.
+    """
+    try:
+        from hermes_cli import kanban_provider_wall as kpw
+
+        root = kpw.provider_wall_root()
+        if root is None:
+            return False
+        reading = kpw.live_wall_state(root=root)
+        return reading.get("state") == kpw.WALL_UP
+    except Exception:
+        return False
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1626,6 +1649,14 @@ def check_respawn_guard(
         ended_at = _kb._to_epoch(latest_run["ended_at"])
         if ended_at is not None and (now - ended_at) < rl_cooldown:
             return "rate_limit_cooldown"
+        # The cooldown elapsed, but the cooldown is a LOCAL timer: it knows
+        # nothing about provider recovery. Re-admitting on the timer alone can
+        # push the card straight back into a live quota wall — the 2026-11-13
+        # 06:19 ET blackout re-admitted a whole cohort into the wall every
+        # cooldown expiry and burned the fleet's quota re-learning the same
+        # fact. Re-check the LIVE wall before letting the card back in.
+        if _provider_wall_is_up():
+            return "provider_wall"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
         # (spaced by the cooldown) until quota returns or a real run supersedes it.

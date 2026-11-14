@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -1130,8 +1131,87 @@ def _cmd_archive(args: argparse.Namespace) -> int:
         if purge_ids:
             return _bulk_apply(purge_ids, lambda tid: kb.delete_archived_task(conn, tid), lambda tid: f"Deleted {tid}",
                                lambda tid: f"cannot delete {tid} (must already be archived)")
-        return _bulk_apply(ids, lambda tid: kb.archive_task(conn, tid),
+        return _bulk_apply(ids, lambda tid: _archive_one(conn, tid),
                            lambda tid: f"Archived {tid}", lambda tid: f"cannot archive {tid}")
+
+
+# A card in the provider-wall class: its title/body names the wall itself.
+_PROVIDER_WALL_CARD_RE = re.compile(
+    r"(?i)(\b2067\b|token[ -]plan usage limit|provider wall|quota wall|"
+    r"rate[ -]limit wall|token plan wall|token-plan wall)",
+)
+
+
+def _provider_wall_archive_refusal(conn, task_id: str) -> Optional[str]:
+    """Why this card must not be archived right now, or ``None``.
+
+    Two refusals, both about the same defect class:
+
+    1. The card's own last run died on a quota wall (HTTP 429 / 2067) and that
+       death is still inside the rate-limit cooldown. Such a card is not
+       resolved — its work never happened.
+    2. The card tracks the provider wall and the wall is measurably UP right
+       now. Archiving it then removes the only owner of a live defect.
+
+    The 2026-11-13 06:29:43 ET archive of ``t_4b4735f7`` is exactly what this
+    refuses: the wall had re-armed at 06:19:55 ET and that card's own final
+    worker run died on 2067 at 06:19:45 ET — ten minutes before it was
+    archived as resolved, which is why the recurrence went unowned for 3.5
+    hours.
+    """
+    row = conn.execute(
+        "SELECT title, body FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+
+    now = int(time.time())
+    cooldown = kb._resolve_rate_limit_cooldown_seconds()
+    latest = conn.execute(
+        "SELECT outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["outcome"] == "rate_limited":
+        ended_at = kb._to_epoch(latest["ended_at"])
+        if ended_at is not None and cooldown > 0 and (now - ended_at) < cooldown:
+            return (
+                f"its worker run died on the provider wall {now - ended_at}s ago "
+                f"(inside the {cooldown}s rate-limit cooldown) — a card that died on a "
+                "quota wall is not resolved; archive it once the cooldown has elapsed "
+                "and the wall is down"
+            )
+
+    text = f"{row['title'] or ''}\n{row['body'] or ''}"
+    if not _PROVIDER_WALL_CARD_RE.search(text):
+        return None
+    try:
+        from hermes_cli import kanban_provider_wall as kpw
+
+        root = kpw.provider_wall_root()
+        if root is None:
+            return None
+        reading = kpw.live_wall_state(root=root)
+    except Exception:
+        return None
+    if reading.get("state") == kpw.WALL_UP:
+        detail = reading.get("detail") or reading.get("status") or "no detail"
+        return (
+            f"the provider wall is measurably UP right now ({detail}) — archiving a "
+            "provider tracker while the defect it tracks is live removes the only "
+            "owner of that defect"
+        )
+    return None
+
+
+def _archive_one(conn, task_id: str) -> bool:
+    """Archive one card, refusing while the provider wall still owns it."""
+    refusal = _provider_wall_archive_refusal(conn, task_id)
+    if refusal:
+        print(f"cannot archive {task_id}: {refusal}", file=sys.stderr)
+        return False
+    return kb.archive_task(conn, task_id)
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:
