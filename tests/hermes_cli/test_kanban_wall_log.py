@@ -281,6 +281,33 @@ def test_a_stale_wall_hit_reads_unknown_not_up(tmp_path):
     assert state.verdict(now=datetime(2026, 11, 1, 23, 45, 0)) == kwl.WALL_UP
 
 
+def test_a_windowed_reading_is_judged_against_the_window_end(tmp_path):
+    """A historical burst must not read as "unknown" just because it is past.
+
+    Judged against the wall clock, every hit in a window from yesterday is
+    stale, so the window would always answer "unknown" — which says nothing
+    about the window. The reference is the end of the window instead.
+    """
+    log_dir = tmp_path / "logs"
+    _write_log(log_dir, "errors.log", [REAL_WALL_LINE])
+    state = kwl.read_profile_state("mark", log_dir)
+    window_end = datetime(2026, 11, 14, 23, 42, 0)
+    assert state.verdict(now=datetime(2026, 11, 15, 2, 0, 0)) == kwl.WALL_UNKNOWN
+    assert state.verdict(now=datetime(2026, 11, 15, 2, 0, 0), reference=window_end) == kwl.WALL_UP
+
+
+def test_a_windowed_host_reading_is_judged_against_the_window_end(tmp_path):
+    root = tmp_path / ".hermes"
+    _write_log(root / "profiles" / "mark" / "logs", "errors.log", [REAL_WALL_LINE])
+    state = kwl.host_wall_state(
+        root,
+        since=datetime(2026, 11, 14, 23, 28, 0),
+        until=datetime(2026, 11, 14, 23, 42, 0),
+        now=datetime(2026, 11, 15, 2, 0, 0),
+    )
+    assert state["state"] == kwl.WALL_UP
+
+
 def test_the_rotated_log_is_read(tmp_path):
     """``errors.log`` rotates at ~97 KB, so a window can live in ``.1``."""
     log_dir = tmp_path / "logs"

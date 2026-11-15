@@ -181,13 +181,24 @@ class ProfileWallState:
     coverage_start: Optional[str] = None
     coverage_end: Optional[str] = None
 
-    def verdict(self, *, now: Optional[datetime] = None, max_age_seconds: int = 3600) -> str:
+    def verdict(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        max_age_seconds: int = 3600,
+        reference: Optional[datetime] = None,
+    ) -> str:
         """``up`` / ``down`` / ``unknown`` for THIS profile.
 
         A wall hit is only evidence that the wall is up NOW while it is still
         fresh. An ancient hit — a profile that died on the wall a week ago and
         has not run since — says nothing about the present, so it reads
         ``unknown`` rather than ``up``.
+
+        ``reference`` is the instant the freshness is measured against: the
+        end of the window being examined when one was given, and ``now``
+        otherwise. Without it a historical window would always read
+        ``unknown``, because its hits are by definition in the past.
         """
         if self.last_wall_hit is None and self.last_served_call is None:
             return WALL_UNKNOWN
@@ -200,17 +211,23 @@ class ProfileWallState:
             return WALL_DOWN
         if walled is None:
             return WALL_UNKNOWN
-        if now is None:
-            now = datetime.now()
-        if (now - walled).total_seconds() <= max_age_seconds:
+        if reference is None:
+            reference = now if now is not None else datetime.now()
+        if (reference - walled).total_seconds() <= max_age_seconds:
             return WALL_UP
         return WALL_UNKNOWN
 
-    def to_dict(self, *, now: Optional[datetime] = None, max_age_seconds: int = 3600) -> dict[str, Any]:
+    def to_dict(
+        self,
+        *,
+        now: Optional[datetime] = None,
+        max_age_seconds: int = 3600,
+        reference: Optional[datetime] = None,
+    ) -> dict[str, Any]:
         return {
             "profile": self.name,
             "log_dir": self.log_dir,
-            "verdict": self.verdict(now=now, max_age_seconds=max_age_seconds),
+            "verdict": self.verdict(now=now, max_age_seconds=max_age_seconds, reference=reference),
             "last_wall_hit": self.last_wall_hit.to_dict() if self.last_wall_hit else None,
             "wall_hit_count": self.wall_hit_count,
             "last_served_call": self.last_served_call,
@@ -555,7 +572,14 @@ def host_wall_state(
         )
 
     sanity = sanity_check()
-    verdicts = {state.verdict(now=now, max_age_seconds=max_age_seconds) for state in states}
+    # A windowed reading is judged against the END of the window, not against
+    # the wall clock: a historical burst must not read as "unknown" merely
+    # because its hits are in the past.
+    reference = until if until is not None else now
+    verdicts = {
+        state.verdict(now=now, max_age_seconds=max_age_seconds, reference=reference)
+        for state in states
+    }
     if not sanity["ok"]:
         verdict = WALL_UNKNOWN
     elif WALL_UP in verdicts:
@@ -575,7 +599,8 @@ def host_wall_state(
             "until": until.isoformat() if until else None,
         },
         "profiles": [
-            state.to_dict(now=now, max_age_seconds=max_age_seconds) for state in states
+            state.to_dict(now=now, max_age_seconds=max_age_seconds, reference=reference)
+            for state in states
         ],
     }
 
