@@ -23,6 +23,7 @@ from typing import Callable
 from typing import Iterable
 from typing import Iterator
 from typing import Mapping
+from typing import NamedTuple
 from typing import Optional
 from typing import TYPE_CHECKING
 
@@ -1913,13 +1914,61 @@ def configured_max_in_progress() -> Optional[int]:
         raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
     except Exception:
         return None
-    if raw is None:
+    return _optional_positive_int(raw)
+
+
+def _optional_positive_int(value: Any) -> Optional[int]:
+    """A positive int, or None when unset, unparseable, or below 1.
+
+    The optional twin of :func:`_positive_int`: a cap that is absent means
+    "no limit", which is a different answer from "cap of zero" and must be
+    representable.
+    """
+    if value is None:
         return None
     try:
-        ival = int(raw)
+        parsed = int(value)
     except (TypeError, ValueError):
         return None
-    return ival if ival >= 1 else None
+    return parsed if parsed >= 1 else None
+
+
+class CapacityCaps(NamedTuple):
+    """The concurrency caps that bound how much work may run at once.
+
+    ``max_in_progress`` is the HOST-wide cap (counted across every board);
+    ``max_in_progress_per_profile`` bounds one profile's share of it;
+    ``max_spawn`` is the per-board cap. ``None`` means "no limit".
+    """
+
+    max_in_progress: Optional[int]
+    max_in_progress_per_profile: Optional[int]
+    max_spawn: Optional[int]
+
+
+def resolve_capacity_caps(kanban_cfg: Optional[Mapping[str, Any]] = None) -> CapacityCaps:
+    """Effective capacity caps from a ``kanban:`` config mapping.
+
+    Single source of truth for the concurrency caps: the gateway's embedded
+    dispatcher, the CLI dispatch path and the standalone daemon all resolve
+    through here, so they cannot disagree about the host-wide budget. The
+    divergence is what let the embedded dispatcher admit above the operator's
+    ceiling while the CLI path honoured it (#38534647).
+
+    An explicit positive integer wins for each cap. An unset host-wide cap falls
+    back to the memory-derived default; an unset per-profile or per-board cap
+    stays unset (no limit).
+    """
+    cfg = kanban_cfg if isinstance(kanban_cfg, Mapping) else {}
+    return CapacityCaps(
+        max_in_progress=resolve_max_in_progress(
+            _optional_positive_int(cfg.get("max_in_progress"))
+        ),
+        max_in_progress_per_profile=_optional_positive_int(
+            cfg.get("max_in_progress_per_profile")
+        ),
+        max_spawn=_optional_positive_int(cfg.get("max_spawn")),
+    )
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
