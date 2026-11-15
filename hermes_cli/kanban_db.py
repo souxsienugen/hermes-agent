@@ -4062,6 +4062,27 @@ def _to_epoch(val) -> Optional[int]:
         return None
 
 
+def run_clock_is_usable(clock: Optional[int]) -> bool:
+    """True when a run clock yields a USABLE age.
+
+    A run clock is usable only when it is a real epoch int. Two values leave
+    the run's age UNKNOWN:
+
+    * ``None`` — the start is not a readable timestamp (an outside writer left
+      text behind), so there is no age to compute;
+    * ``0`` — epoch zero. It parses, but no run really started at the epoch,
+      so its age is as unknown as a timestamp that does not parse.
+
+    The engine never reclaims a run whose age is unknown
+    (``kanban_db_dispatch.detect_stale_running`` skips a falsy clock), so the
+    board must reach the same verdict: an unknown age is never painted stale.
+
+    This is the same predicate the engine applies (``not clock`` on the
+    coerced value), named so both sides can be read against one rule.
+    """
+    return clock is not None and clock != 0
+
+
 def task_age(task: Task) -> dict:
     """Return age metrics for a single task. All values are seconds or None."""
     now = int(time.time())
@@ -4272,19 +4293,30 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
     arithmetic is NaN, which silently paints a stalled card as NOT stale.
     A value that is not a readable timestamp yields None (no usable run clock).
 
-    Three states a consumer must tell apart:
+    Four states a consumer must tell apart:
 
     * the task id is ABSENT — the task has NO live run (never claimed, or the
-      run closed). There is no run clock at all; a card in this state ages from
-      its first-ever start (``tasks.started_at``), which is the same fallback
-      the engine's ``COALESCE(r.started_at, t.started_at)`` makes.
-    * the value is an int — the live run's start, as an epoch int.
+      run closed, or the pointer is dangling). There is no run clock at all; a
+      card in this state ages from its first-ever start
+      (``tasks.started_at``), which is the same fallback the engine's
+      ``COALESCE(r.started_at, t.started_at)`` makes.
+    * the value is a USABLE int — the live run's start, as an epoch int, and
+      the run's age can be computed from it. This is the only state the board
+      ages a card from.
+    * the value is 0 — epoch zero. It is a readable int but NOT a usable age:
+      no real run started at the epoch, so the age is as unknown as a
+      timestamp that does not parse.
     * the value is None — the task HAS a live run but its start is NOT a
-      readable timestamp. The run's age is UNKNOWN: it is neither zero nor
-      "fall back to the first-ever start". The engine never reclaims a run
-      whose age is unknown (``kanban_db_dispatch.detect_stale_running``), so
-      the board must not paint such a card stale either — the payload marks
-      this state explicitly (``current_run_started_at_unreadable``).
+      readable timestamp. The run's age is UNKNOWN here too.
+
+    Both unusable states (0 and None) leave the run's age unknown, and the
+    engine never reclaims a run whose age is unknown
+    (``kanban_db_dispatch.detect_stale_running`` skips any run whose clock is
+    not usable). The board must reach the same verdict, so the payload marks
+    those cards explicitly (``current_run_age_unknown``) rather than
+    painting them stale — that would cry wolf about a run the engine
+    protects. ``run_clock_is_usable`` is the shared predicate for that
+    decision; the engine's own guard protects exactly the same clock values.
     """
     ids = list(task_ids)
     if not ids:
