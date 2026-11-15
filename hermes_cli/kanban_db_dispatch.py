@@ -810,14 +810,22 @@ def detect_stale_running(
             continue
         clock = _kb._to_epoch(row["active_started_at"])
         if not clock:
-            # Unreadable clock (a non-timestamp left behind by an outside
-            # writer): the run's age is UNKNOWN, and an unknown age is never
-            # "over the threshold" — so this run is never reclaimed. The
-            # board's stalenessClass applies the same rule and does not paint
-            # the card stale either. Falling back to the first-ever start here
+            # The clock yields NO usable age: it is either not a readable
+            # timestamp (a non-timestamp left behind by an outside writer) or
+            # epoch zero (0 — a readable int, but no real run started at the
+            # epoch, so it is not a usable age either). Either way the run's
+            # age is UNKNOWN, and an unknown age is never "over the
+            # threshold" — so this run is never reclaimed. The board's
+            # stalenessClass applies the same rule and does not paint the
+            # card stale either. Falling back to the first-ever start here
             # would be the ORIGINAL bug's shape on this side: a re-dispatched
             # card's first-ever start never resets, so it would age forever
             # and get a healthy live run killed.
+            #
+            # The matching board-side rule is kanban_db.run_clock_is_usable
+            # (the payload marker current_run_age_unknown), which protects
+            # exactly the same clock values — the two are pinned together by
+            # test_run_clock_is_usable_matches_the_engines_own_clock_guard.
             continue
         elapsed = now - clock
         if elapsed < stale_timeout_seconds:

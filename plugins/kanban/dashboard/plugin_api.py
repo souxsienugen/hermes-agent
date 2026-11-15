@@ -180,7 +180,7 @@ _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
                current_run_started_at: Optional[int] = None,
-               current_run_started_at_unreadable: bool = False) -> dict[str, Any]:
+               current_run_age_unknown: bool = False) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
@@ -192,26 +192,30 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     # Start of the current task_runs row (``tasks.started_at`` is the FIRST-EVER
     # start; after a retry the run clock must tick from the fresh run).
     d["current_run_started_at"] = current_run_started_at
-    # The live run EXISTS but its start is not a readable timestamp: the run's
-    # age is UNKNOWN. The engine never reclaims a run whose age is unknown
-    # (``kanban_db_dispatch.detect_stale_running``), so the board must not
-    # paint such a card stale either — that would cry wolf about a run the
-    # engine deliberately protects. False for a card with no live run at all:
-    # that one ages from its first-ever start, the engine's own COALESCE
-    # fallback, so the two sides agree there without a marker.
-    d["current_run_started_at_unreadable"] = current_run_started_at_unreadable
+    # The live run EXISTS but its start does not yield a USABLE age: it is
+    # either not a readable timestamp (None) or epoch zero (0) — a value no real
+    # run can have. The engine never reclaims a run whose age is unknown
+    # (``kanban_db_dispatch.detect_stale_running`` skips a run whose clock is
+    # not usable), so the board must not paint such a card stale either — that
+    # would cry wolf about a run the engine deliberately protects. False for a
+    # card with no live run at all: that one ages from its first-ever start,
+    # the engine's own COALESCE fallback, so the two sides agree there without
+    # a marker.
+    d["current_run_age_unknown"] = current_run_age_unknown
     return d
 
 
-def _run_clock_unreadable(run_start_map: dict[str, Optional[int]], task_id: str) -> bool:
-    """True when the task HAS a live run whose start is not a readable timestamp.
+def _run_age_unknown(run_start_map: dict[str, Optional[int]], task_id: str) -> bool:
+    """True when the task HAS a live run whose start yields no usable age.
 
     ``kanban_db.current_run_started_ats`` omits tasks with no live run, so the
-    key's presence is the "has a live run" signal and a ``None`` value is the
-    "unreadable clock" signal. See that function's docstring for the three
-    states a consumer has to tell apart.
+    key's presence is the "has a live run" signal. The value is the run's
+    start as an epoch int, and it is UNUSABLE in exactly two cases — ``None``
+    (not a readable timestamp) and ``0`` (epoch zero) — which
+    ``kanban_db.run_clock_is_usable`` is the single definition of. See that
+    function's docstring for the states a consumer has to tell apart.
     """
-    return task_id in run_start_map and run_start_map[task_id] is None
+    return task_id in run_start_map and not kanban_db.run_clock_is_usable(run_start_map[task_id])
 
 
 def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
@@ -347,7 +351,7 @@ def get_board(
             full = summary_map.get(t.id)
             d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
                            current_run_started_at=run_start_map.get(t.id),
-                           current_run_started_at_unreadable=_run_clock_unreadable(run_start_map, t.id))
+                           current_run_age_unknown=_run_age_unknown(run_start_map, t.id))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -414,7 +418,7 @@ def get_task(
         task_d = _task_dict(
             task, latest_summary=kanban_db.latest_summary(conn, task_id),
             current_run_started_at=run_starts.get(task_id),
-            current_run_started_at_unreadable=_run_clock_unreadable(run_starts, task_id))
+            current_run_age_unknown=_run_age_unknown(run_starts, task_id))
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
@@ -465,7 +469,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         body: dict[str, Any] = {"task": _task_dict(
             task,
             current_run_started_at=run_starts.get(task_id),
-            current_run_started_at_unreadable=_run_clock_unreadable(run_starts, task_id),
+            current_run_age_unknown=_run_age_unknown(run_starts, task_id),
         ) if task else None}
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
@@ -741,7 +745,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         return {"task": _task_dict(
             updated,
             current_run_started_at=run_starts.get(task_id),
-            current_run_started_at_unreadable=_run_clock_unreadable(run_starts, task_id),
+            current_run_age_unknown=_run_age_unknown(run_starts, task_id),
         ) if updated else None}
 
 
