@@ -1602,13 +1602,13 @@ def test_workers_active_is_ordered_by_the_started_at_it_hands_out(client):
     assert starts[0] == 1794479400, starts
 
 
-def test_board_payload_marks_an_unreadable_run_clock(client):
-    """A live run whose start is NOT a readable timestamp must be marked.
+def test_board_payload_marks_a_run_clock_with_no_usable_age(client):
+    """A live run whose start yields NO usable age must be marked.
 
     ``current_run_started_at`` is ``number | null``, so an unreadable clock
     reaches the frontend as null — the same value a card with NO live run
     carries. The two are not the same thing: the engine reads the age of an
-    unreadable clock as UNKNOWN and never reclaims such a run
+    unusable clock as UNKNOWN and never reclaims such a run
     (``detect_stale_running``), while a card with no live run ages from its
     first-ever start on BOTH sides. The board has to be able to tell them
     apart, so the payload carries an explicit marker.
@@ -1616,6 +1616,13 @@ def test_board_payload_marks_an_unreadable_run_clock(client):
     Without the marker the board falls back to the first-ever age and paints
     a card RED that the engine deliberately protects — the original bug's
     shape, with the sign flipped.
+
+    Epoch zero is the second unusable clock, and it is the case that used to
+    slip through: ``0`` is a READABLE int, so it took the "readable clock"
+    path, the board aged the card from 1970 and painted it RED while the
+    engine protected the very same run. The marker now covers it, while
+    ``current_run_started_at`` keeps the raw ``0`` so a consumer can still
+    tell epoch zero from a normal positive epoch.
     """
     now = int(time.time())
     conn = kbc.connect()
@@ -1637,6 +1644,21 @@ def test_board_payload_marks_an_unreadable_run_clock(client):
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, unreadable))
+
+        # A live run whose start is EPOCH ZERO: readable, but no usable age.
+        epoch_zero = kb.create_task(conn, title="epoch-zero-clock", assignee="x")
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 30 * 24 * 3600, lock, future, 99999, epoch_zero),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (epoch_zero, lock, future, 99999, 0),
+        )
+        epoch_run = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (epoch_run, epoch_zero))
 
         # A live run with a READABLE start: not marked.
         readable = kb.create_task(conn, title="readable-clock", assignee="x")
@@ -1666,21 +1688,31 @@ def test_board_payload_marks_an_unreadable_run_clock(client):
 
     # Unreadable clock: null value AND the marker.
     assert by_id[unreadable]["current_run_started_at"] is None, by_id[unreadable]
-    assert by_id[unreadable]["current_run_started_at_unreadable"] is True, by_id[unreadable]
+    assert by_id[unreadable]["current_run_age_unknown"] is True, by_id[unreadable]
+
+    # Epoch zero: the RAW zero is preserved (so it is still distinguishable
+    # from a normal positive epoch) AND the card is marked.
+    assert by_id[epoch_zero]["current_run_started_at"] == 0, by_id[epoch_zero]
+    assert by_id[epoch_zero]["current_run_age_unknown"] is True, by_id[epoch_zero]
 
     # Readable clock: the epoch int, and NOT marked.
     assert by_id[readable]["current_run_started_at"] == now - 300, by_id[readable]
-    assert by_id[readable]["current_run_started_at_unreadable"] is False, by_id[readable]
+    assert by_id[readable]["current_run_age_unknown"] is False, by_id[readable]
 
-    # No live run: null value, and NOT marked (there is no run to be
-    # unreadable — the card ages from its first-ever start on both sides).
+    # No live run: null value, and NOT marked (there is no run whose clock
+    # could be unusable — the card ages from its first-ever start on both
+    # sides).
     assert by_id[no_run]["current_run_started_at"] is None, by_id[no_run]
-    assert by_id[no_run]["current_run_started_at_unreadable"] is False, by_id[no_run]
+    assert by_id[no_run]["current_run_age_unknown"] is False, by_id[no_run]
 
     # The detail endpoint carries the same contract.
     detail = client.get(f"/api/plugins/kanban/tasks/{unreadable}").json()["task"]
     assert detail["current_run_started_at"] is None, detail
-    assert detail["current_run_started_at_unreadable"] is True, detail
+    assert detail["current_run_age_unknown"] is True, detail
+
+    epoch_detail = client.get(f"/api/plugins/kanban/tasks/{epoch_zero}").json()["task"]
+    assert epoch_detail["current_run_started_at"] == 0, epoch_detail
+    assert epoch_detail["current_run_age_unknown"] is True, epoch_detail
 
 
 def test_dashboard_heartbeat_gap_equals_the_engine_constant():

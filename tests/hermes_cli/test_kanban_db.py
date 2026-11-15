@@ -1832,6 +1832,78 @@ def test_detect_stale_running_reclaims_when_the_same_clock_is_readable(kanban_ho
         conn.close()
 
 
+def test_detect_stale_running_never_reclaims_an_epoch_zero_run_clock(kanban_home, monkeypatch):
+    """A run whose start reads EPOCH ZERO is NEVER reclaimed.
+
+    Epoch zero is a READABLE int — ``_to_epoch`` returns ``0`` for it, not
+    ``None`` — so it used to take the "readable clock" path here: the sweep
+    aged the run from 1970 and reclaimed it. That was the engine's half of
+    the last board/engine clock disagreement, and the board has to be able to
+    agree with whatever the engine does here.
+
+    The engine's rule is that a clock which is not USABLE leaves the run's
+    age UNKNOWN, and an unknown age is never over the threshold — so such a
+    run is never reclaimed. Epoch zero is not a usable age (no real run
+    started at the epoch), so it is protected on both sides. Reclaiming it
+    would kill a worker that may be perfectly alive, on the strength of a
+    value nobody understands.
+    """
+    monkeypatch.setattr(kbd, "_terminate_reclaimed_worker", lambda *a, **k: {"terminated": True})
+    now = int(time.time())
+    ancient = now - 30 * 24 * 3600  # 30 days ago: far over any threshold
+
+    conn, task_id = _running_with_clock(
+        kanban_home, run_started_at=0, first_started_at=ancient, heartbeat=None,
+    )
+    try:
+        # Every other condition for a reclaim is met: the card is running,
+        # long past the threshold, with no heartbeat. The epoch-zero clock is
+        # the one thing that saves it — and it must.
+        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == []
+        still_running = kb.get_task(conn, task_id)
+        assert still_running is not None
+        assert still_running.status == "running"
+    finally:
+        conn.close()
+
+
+def test_run_clock_is_usable_matches_the_engines_own_clock_guard():
+    """The board's "usable age" rule must BE the engine's clock guard.
+
+    ``detect_stale_running`` skips a run whose coerced clock is FALSY — that
+    is, whose clock is ``None`` (not a readable timestamp) or ``0`` (epoch
+    zero) — and treats its age as unknown. The board's marker
+    (``kanban_db.run_clock_is_usable``) decides the same question, so the two
+    sides cannot drift apart on which clock values they protect.
+
+    This pins the two rules together over every clock value a column can
+    hold: if either one is changed to cover a value the other does not, this
+    test fails.
+    """
+    now = int(time.time())
+    for raw in (None, 0, "0", 0.0, False, "", "   ", "not-a-timestamp", 1, -5,
+                1794479400, "1794479400", now):
+        clock = kb._to_epoch(raw)
+        # The engine's guard, verbatim: it skips the run when the clock is falsy.
+        engine_protects = not clock
+        # The board's marker: it marks the card when the clock is not usable.
+        board_marks = not kb.run_clock_is_usable(clock)
+        assert board_marks == engine_protects, (raw, clock, board_marks, engine_protects)
+
+
+def test_run_clock_is_usable_rejects_only_epoch_zero_and_none():
+    """Only two clock values are unusable: ``None`` and epoch zero.
+
+    Every other epoch int — including a NEGATIVE one — is a real timestamp
+    and yields a real (if odd) age, so both sides age from it.
+    """
+    assert kb.run_clock_is_usable(None) is False
+    assert kb.run_clock_is_usable(0) is False
+    assert kb.run_clock_is_usable(1) is True
+    assert kb.run_clock_is_usable(-5) is True
+    assert kb.run_clock_is_usable(1794479400) is True
+
+
 
 # ---------------------------------------------------------------------------
 # Corruption guard (issue #30687)

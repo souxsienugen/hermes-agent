@@ -16,11 +16,13 @@
 // worker is still reporting is not a stall. This probe pins that same
 // two-condition rule so the board and the dispatcher agree.
 //
-// The other half of the agreement: when the live run's start is NOT a
-// readable timestamp, the age is UNKNOWN. The engine never reclaims such a
-// run (an unknown age is never over the threshold — reclaiming would kill a
-// worker that may be alive), so the board must not paint the card stale
-// either, even though its first-ever age is over the tier.
+// The other half of the agreement: when the live run's start yields NO usable
+// age, the age is UNKNOWN. That covers a start that is not a readable
+// timestamp AND epoch zero (0) — a readable int no real run can have. The
+// engine never reclaims such a run (an unknown age is never over the
+// threshold — reclaiming would kill a worker that may be alive), so the
+// board must not paint the card stale either, even though its first-ever age
+// is over the tier.
 //
 // Run via: node kanban_staleness_probe.js <path-to-bundle>
 const fs = require("fs");
@@ -162,9 +164,9 @@ check("heartbeat gap constant matches the engine's 3600s", STALE_HEARTBEAT_GAP_S
 // Build a card shaped exactly like the backend's _task_dict output.
 // startedAt is the FIRST-EVER start; runStart is the CURRENT run's start
 // (null when the card has no live run, and also null when the live run's
-// start is not a readable timestamp — runClockUnreadable tells those two
+// start is not a readable timestamp — runAgeUnknown tells those two
 // apart, exactly as the backend's payload does).
-function runningCard({ startedAt, runStart, lastHeartbeat, now, runClockUnreadable }) {
+function runningCard({ startedAt, runStart, lastHeartbeat, now, runAgeUnknown }) {
   const serverNow = now === undefined ? NOW : now;
   return {
     id: "t_probe",
@@ -172,7 +174,7 @@ function runningCard({ startedAt, runStart, lastHeartbeat, now, runClockUnreadab
     started_at: startedAt,
     created_at: startedAt - 600,
     current_run_started_at: runStart,
-    current_run_started_at_unreadable: runClockUnreadable === true,
+    current_run_age_unknown: runAgeUnknown === true,
     last_heartbeat_at: lastHeartbeat === undefined ? null : lastHeartbeat,
     age: {
       created_age_seconds: serverNow - (startedAt - 600),
@@ -282,10 +284,10 @@ const noRunStalled = runningCard({
 check("running card with no current run and no heartbeat is red",
   stalenessClass(noRunStalled), RED);
 
-// --- An UNREADABLE run clock: the age is UNKNOWN on BOTH sides -------------
+// --- A run clock with NO usable age: the age is UNKNOWN on BOTH sides ------
 // A live run whose start is not a readable timestamp (an outside writer left
 // a non-timestamp behind): the backend reports current_run_started_at: null
-// plus current_run_started_at_unreadable: true.
+// plus current_run_age_unknown: true.
 //
 // The engine's rule (hermes_cli/kanban_db_dispatch.detect_stale_running) is
 // that an UNKNOWN age is never over the threshold — such a run is never
@@ -296,7 +298,7 @@ check("running card with no current run and no heartbeat is red",
 const unreadableClock = runningCard({
   startedAt: NOW - 2560 * 60,
   runStart: null,
-  runClockUnreadable: true,
+  runAgeUnknown: true,
   lastHeartbeat: null,
 });
 check("running card with an unreadable run clock is not stale",
@@ -310,11 +312,47 @@ check("running card with an unreadable run clock is not amber",
 const unreadableClockAlive = runningCard({
   startedAt: NOW - 2560 * 60,
   runStart: null,
-  runClockUnreadable: true,
+  runAgeUnknown: true,
   lastHeartbeat: NOW - 5,
 });
 check("running card with an unreadable run clock and a live worker is not stale",
   stalenessClass(unreadableClockAlive), "");
+
+// --- An EPOCH-ZERO run clock: also NO usable age ---------------------------
+// A live run whose start reads epoch zero (0): the backend reports
+// current_run_started_at: 0 plus current_run_age_unknown: true.
+//
+// Epoch zero is a READABLE int, so it used to slip past the "unreadable"
+// marker entirely — the board then aged the card from epoch 0 (56 years ago)
+// and painted it RED while the engine, whose rule is "a clock that is not
+// usable is never over the threshold", deliberately protected the very same
+// run. That was the last board/engine disagreement over a run clock.
+//
+// The payload keeps the raw 0 in current_run_started_at, so a consumer can
+// still tell epoch zero from a normal positive epoch; the marker carries the
+// separate fact that this clock yields NO usable age.
+const epochZeroClock = runningCard({
+  startedAt: NOW - 2560 * 60,
+  runStart: 0,
+  runAgeUnknown: true,
+  lastHeartbeat: null,
+});
+check("running card with an epoch-zero run clock is not stale",
+  stalenessClass(epochZeroClock), "");
+check("running card with an epoch-zero run clock is not red",
+  stalenessClass(epochZeroClock) === RED, false);
+check("running card with an epoch-zero run clock is not amber",
+  stalenessClass(epochZeroClock) === AMBER, false);
+
+// The same verdict with a worker that is still heartbeating: also not stale.
+const epochZeroClockAlive = runningCard({
+  startedAt: NOW - 2560 * 60,
+  runStart: 0,
+  runAgeUnknown: true,
+  lastHeartbeat: NOW - 5,
+});
+check("running card with an epoch-zero run clock and a live worker is not stale",
+  stalenessClass(epochZeroClockAlive), "");
 
 // The marker must NOT disarm a card whose run clock IS readable — the same
 // shape with a readable run start is still a stall.
@@ -365,12 +403,12 @@ check("blocked card under 1h is not stale", stalenessClass(plainCard("blocked", 
 check("done card is never stale", stalenessClass(plainCard("done", 100 * 24 * 3600)), "");
 check("card with no age payload is not stale", stalenessClass({ id: "x", status: "running" }), "");
 
-// The unreadable-clock marker is about the RUN clock, so it must not disarm
+// The unusable-clock marker is about the RUN clock, so it must not disarm
 // the non-running columns: a queued card still ages from its created age,
 // exactly as before.
 const queuedWithMarker = plainCard("ready", 25 * 3600);
-queuedWithMarker.current_run_started_at_unreadable = true;
-check("queued card carrying the unreadable-clock marker is still red",
+queuedWithMarker.current_run_age_unknown = true;
+check("queued card carrying the unusable-clock marker is still red",
   stalenessClass(queuedWithMarker), RED);
 
 if (failures) {
