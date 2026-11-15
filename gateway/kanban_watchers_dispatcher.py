@@ -53,16 +53,26 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         interval = 60.0
     interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-    max_spawn = kanban_cfg.get("max_spawn")
+    # The capacity caps come from the shared resolver so the gateway's boot
+    # snapshot and its per-tick live re-read can never disagree about what the
+    # cap IS -- the divergence between the embedded dispatcher and the CLI
+    # dispatch path is what let the host run above the operator's ceiling
+    # (#38534647).
+    caps = _kbd().resolve_capacity_caps(kanban_cfg)
+
+    max_spawn = caps.max_spawn
     if max_spawn is not None:
         logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
     # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
-    effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if max_in_progress is None and effective_max_in_progress is not None:
+    # ``_positive_int_setting`` logs the CONFIGURED value (the operator-facing
+    # evidence trail for "which cap is in force"); ``caps`` carries the EFFECTIVE
+    # one, with the same fallback applied.
+    configured_max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+    effective_max_in_progress = caps.max_in_progress
+    if configured_max_in_progress is None and effective_max_in_progress is not None:
         logger.info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
             "memory-derived default max_in_progress=%d "
@@ -172,17 +182,25 @@ class _KanbanDispatcher:
         self.disabled_corrupt_boards.pop(slug, None)
         return True
 
-    def tick_once_for_board(self, slug: str) -> Optional[object]:
+    def tick_once_for_board(self, slug: str, caps: Any = None) -> Optional[object]:
         """Run one dispatch_once for a specific board.
 
         The per-board DB is opened explicitly so boards never share a
         connection or claim across each other.
+
+        ``caps`` carries the LIVE capacity caps for this tick. They override the
+        boot-time snapshot in ``self.settings`` so an operator's ceiling edit
+        binds on the next tick instead of the next gateway restart (#38534647).
         """
         conn = None
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        if caps is not None:
+            kwargs["max_in_progress"] = caps.max_in_progress
+            kwargs["max_in_progress_per_profile"] = caps.max_in_progress_per_profile
+            kwargs["max_spawn"] = caps.max_spawn
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -212,9 +230,15 @@ class _KanbanDispatcher:
                 with contextlib.suppress(Exception):
                     conn.close()
 
-    def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+    def tick_once(self, caps: Any = None) -> list[tuple[str, Optional[object]]]:
+        """Run one dispatch_once per board. Returns (slug, result) pairs.
+
+        ``caps`` carries the LIVE capacity caps for this tick; see
+        :meth:`tick_once_for_board`.
+        """
+        return [
+            (slug, self.tick_once_for_board(slug, caps)) for slug in self._board_slugs()
+        ]
 
     def ready_nonempty(self) -> bool:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
