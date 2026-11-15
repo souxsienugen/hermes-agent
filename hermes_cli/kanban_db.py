@@ -4271,6 +4271,20 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
     computes ``now - current_run_started_at`` — and on a text timestamp that
     arithmetic is NaN, which silently paints a stalled card as NOT stale.
     A value that is not a readable timestamp yields None (no usable run clock).
+
+    Three states a consumer must tell apart:
+
+    * the task id is ABSENT — the task has NO live run (never claimed, or the
+      run closed). There is no run clock at all; a card in this state ages from
+      its first-ever start (``tasks.started_at``), which is the same fallback
+      the engine's ``COALESCE(r.started_at, t.started_at)`` makes.
+    * the value is an int — the live run's start, as an epoch int.
+    * the value is None — the task HAS a live run but its start is NOT a
+      readable timestamp. The run's age is UNKNOWN: it is neither zero nor
+      "fall back to the first-ever start". The engine never reclaims a run
+      whose age is unknown (``kanban_db_dispatch.detect_stale_running``), so
+      the board must not paint such a card stale either — the payload marks
+      this state explicitly (``current_run_started_at_unreadable``).
     """
     ids = list(task_ids)
     if not ids:

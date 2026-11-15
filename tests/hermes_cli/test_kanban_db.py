@@ -1748,7 +1748,88 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
 
 # Stale detection — detect_stale_running
 # ---------------------------------------------------------------------------
+# An UNREADABLE run clock is an UNKNOWN age, and an unknown age is never over
+# the threshold: the engine must never reclaim such a run, because reclaiming
+# kills a worker that may be perfectly alive. The board's stalenessClass
+# applies the same rule (it does not paint such a card stale either), so the
+# two sides agree — see tests/plugins/fixtures/kanban_staleness_probe.js.
 
+
+def _running_with_clock(kanban_home, *, run_started_at, first_started_at, heartbeat=None):
+    """A claimed, running card whose live run's start is ``run_started_at``.
+
+    ``first_started_at`` is the card's FIRST-EVER start — the clock the board
+    used to fall back to. The two are deliberately independent here: the
+    engine ages the run from ``run_started_at`` (falling back to
+    ``first_started_at`` only when there is no live run), while the board
+    falls back to the first-ever age whenever the run clock is unusable.
+    """
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="clock-card", assignee="a")
+        claimed = kb.claim_task(conn, task_id)  # host-local claim lock: the sweep's scope
+        assert claimed is not None
+        kbd._set_worker_pid(conn, task_id, 98765)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET started_at = ?, last_heartbeat_at = ? WHERE id = ?",
+                (first_started_at, heartbeat, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET started_at = ? WHERE id = ?",
+                (run_started_at, claimed.current_run_id),
+            )
+        return conn, task_id
+
+
+def test_detect_stale_running_never_reclaims_an_unreadable_run_clock(kanban_home, monkeypatch):
+    """A run whose start is not a readable timestamp is NEVER reclaimed.
+
+    The engine reads the run's age as UNKNOWN when the clock is unreadable,
+    and an unknown age is never over the threshold. Falling back to the
+    card's first-ever start instead would be the original bug's shape on this
+    side: ``tasks.started_at`` is never reset on re-dispatch, so it ages
+    forever and would get a healthy live run killed.
+    """
+    monkeypatch.setattr(kbd, "_terminate_reclaimed_worker", lambda *a, **k: {"terminated": True})
+    now = int(time.time())
+    ancient = now - 30 * 24 * 3600  # 30 days ago: far over any threshold
+
+    conn, task_id = _running_with_clock(
+        kanban_home, run_started_at="not-a-timestamp", first_started_at=ancient, heartbeat=None,
+    )
+    try:
+        # The card is running, long past the threshold, and has no heartbeat:
+        # every other condition for a reclaim is met. The unreadable clock is
+        # the one thing that saves it — and it must.
+        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == []
+        still_running = kb.get_task(conn, task_id)
+        assert still_running is not None
+        assert still_running.status == "running"
+    finally:
+        conn.close()
+
+
+def test_detect_stale_running_reclaims_when_the_same_clock_is_readable(kanban_home, monkeypatch):
+    """Control for the test above: the SAME card with a readable (old) run
+    clock IS reclaimed.
+
+    Without this the "never reclaims" pin would be vacuous — it would also
+    pass if the sweep simply stopped reclaiming anything.
+    """
+    monkeypatch.setattr(kbd, "_terminate_reclaimed_worker", lambda *a, **k: {"terminated": True})
+    now = int(time.time())
+    ancient = now - 30 * 24 * 3600
+
+    conn, task_id = _running_with_clock(
+        kanban_home, run_started_at=ancient, first_started_at=ancient, heartbeat=None,
+    )
+    try:
+        assert kbd.detect_stale_running(conn, stale_timeout_seconds=1) == [task_id]
+        reclaimed = kb.get_task(conn, task_id)
+        assert reclaimed is not None
+        assert reclaimed.status != "running"
+    finally:
+        conn.close()
 
 
 

@@ -780,6 +780,12 @@ def detect_stale_running(
     ``0`` disables the check; ``signal_fn`` is a test hook. Deliberately NOT
     counted via ``_record_task_failure``: an absent heartbeat is not a worker
     failure, and counting it would let long-running tasks trip the breaker.
+
+    An UNREADABLE clock is an unknown age, never an over-threshold one: a run
+    whose start is not a readable timestamp is never reclaimed here, because
+    reclaiming kills a worker that may be perfectly alive. The board's
+    ``stalenessClass`` mirrors that rule and does not paint such a card stale
+    either — see ``tests/plugins/fixtures/kanban_staleness_probe.js``.
     """
     if stale_timeout_seconds <= 0:
         return []
@@ -801,7 +807,18 @@ def detect_stale_running(
             continue
         if row["active_started_at"] is None:
             continue
-        elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never reclaim
+        clock = _kb._to_epoch(row["active_started_at"])
+        if not clock:
+            # Unreadable clock (a non-timestamp left behind by an outside
+            # writer): the run's age is UNKNOWN, and an unknown age is never
+            # "over the threshold" — so this run is never reclaimed. The
+            # board's stalenessClass applies the same rule and does not paint
+            # the card stale either. Falling back to the first-ever start here
+            # would be the ORIGINAL bug's shape on this side: a re-dispatched
+            # card's first-ever start never resets, so it would age forever
+            # and get a healthy live run killed.
+            continue
+        elapsed = now - clock
         if elapsed < stale_timeout_seconds:
             continue
 

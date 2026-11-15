@@ -179,7 +179,8 @@ _CARD_SUMMARY_PREVIEW_CHARS = 200
 
 
 def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
-               current_run_started_at: Optional[int] = None) -> dict[str, Any]:
+               current_run_started_at: Optional[int] = None,
+               current_run_started_at_unreadable: bool = False) -> dict[str, Any]:
     d = asdict(task)
     # Derived age metrics so the UI can colour stale cards without client deltas.
     try:
@@ -191,7 +192,26 @@ def _task_dict(task: kanban_db.Task, *, latest_summary: Optional[str] = None,
     # Start of the current task_runs row (``tasks.started_at`` is the FIRST-EVER
     # start; after a retry the run clock must tick from the fresh run).
     d["current_run_started_at"] = current_run_started_at
+    # The live run EXISTS but its start is not a readable timestamp: the run's
+    # age is UNKNOWN. The engine never reclaims a run whose age is unknown
+    # (``kanban_db_dispatch.detect_stale_running``), so the board must not
+    # paint such a card stale either — that would cry wolf about a run the
+    # engine deliberately protects. False for a card with no live run at all:
+    # that one ages from its first-ever start, the engine's own COALESCE
+    # fallback, so the two sides agree there without a marker.
+    d["current_run_started_at_unreadable"] = current_run_started_at_unreadable
     return d
+
+
+def _run_clock_unreadable(run_start_map: dict[str, Optional[int]], task_id: str) -> bool:
+    """True when the task HAS a live run whose start is not a readable timestamp.
+
+    ``kanban_db.current_run_started_ats`` omits tasks with no live run, so the
+    key's presence is the "has a live run" signal and a ``None`` value is the
+    "unreadable clock" signal. See that function's docstring for the three
+    states a consumer has to tell apart.
+    """
+    return task_id in run_start_map and run_start_map[task_id] is None
 
 
 def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
@@ -326,7 +346,8 @@ def get_board(
         for t in tasks:
             full = summary_map.get(t.id)
             d = _task_dict(t, latest_summary=(full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None),
-                           current_run_started_at=run_start_map.get(t.id))
+                           current_run_started_at=run_start_map.get(t.id),
+                           current_run_started_at_unreadable=_run_clock_unreadable(run_start_map, t.id))
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -389,9 +410,11 @@ def get_task(
             raise HTTPException(status_code=400, detail="run_state_type must be 'status' or 'outcome'")
         task = _require_task(conn, task_id)
         # Drawer returns the FULL summary (cards on /board carry a 200-char preview).
+        run_starts = kanban_db.current_run_started_ats(conn, [task_id])
         task_d = _task_dict(
             task, latest_summary=kanban_db.latest_summary(conn, task_id),
-            current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id))
+            current_run_started_at=run_starts.get(task_id),
+            current_run_started_at_unreadable=_run_clock_unreadable(run_starts, task_id))
         links = _links_for(conn, task_id)
         child_summaries = kanban_db.latest_summaries(conn, links["children"])
         children = filter(None, (kanban_db.get_task(conn, cid) for cid in links["children"]))
@@ -438,8 +461,11 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
         # CreateTaskBody field names match create_task's keyword parameters.
         task_id = kanban_db.create_task(conn, created_by="dashboard", board=board, **payload.model_dump())
         task = kanban_db.get_task(conn, task_id)
+        run_starts = kanban_db.current_run_started_ats(conn, [task_id])
         body: dict[str, Any] = {"task": _task_dict(
-            task, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
+            task,
+            current_run_started_at=run_starts.get(task_id),
+            current_run_started_at_unreadable=_run_clock_unreadable(run_starts, task_id),
         ) if task else None}
         # Dispatcher-presence warning so the UI can banner a ready+assigned task that would
         # otherwise sit idle (no gateway / dispatch_in_gateway=false); triage/todo are expected
@@ -711,8 +737,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.title is not None or payload.body is not None:
             _patch_title_body(conn, task_id, payload, board)
         updated = kanban_db.get_task(conn, task_id)
+        run_starts = kanban_db.current_run_started_ats(conn, [task_id])
         return {"task": _task_dict(
-            updated, current_run_started_at=kanban_db.current_run_started_ats(conn, [task_id]).get(task_id)
+            updated,
+            current_run_started_at=run_starts.get(task_id),
+            current_run_started_at_unreadable=_run_clock_unreadable(run_starts, task_id),
         ) if updated else None}
 
 

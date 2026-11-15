@@ -3136,6 +3136,17 @@
   // ticks from the current attempt. Cards with no live run fall back to the
   // first-ever age.
   function currentRunAgeSeconds(task, now) {
+    if (task.current_run_started_at_unreadable) {
+      // A live run EXISTS but its start is not a readable timestamp, so the
+      // run's age is UNKNOWN. The engine treats an unknown age as "never
+      // reclaim" (hermes_cli/kanban_db_dispatch.detect_stale_running: an
+      // unreadable clock is never over the threshold, because reclaiming kills
+      // a worker that may be perfectly alive). Painting such a card stale
+      // would cry wolf about a run the engine deliberately protects — the
+      // board and the engine have to agree, so the age stays unknown here
+      // too. NOT ageable, NOT zero, and NOT the first-ever age.
+      return null;
+    }
     if (task.current_run_started_at == null) {
       // No live run to age from: the first-ever start is all we have.
       return task.age.started_age_seconds;

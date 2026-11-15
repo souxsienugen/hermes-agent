@@ -1602,6 +1602,87 @@ def test_workers_active_is_ordered_by_the_started_at_it_hands_out(client):
     assert starts[0] == 1794479400, starts
 
 
+def test_board_payload_marks_an_unreadable_run_clock(client):
+    """A live run whose start is NOT a readable timestamp must be marked.
+
+    ``current_run_started_at`` is ``number | null``, so an unreadable clock
+    reaches the frontend as null — the same value a card with NO live run
+    carries. The two are not the same thing: the engine reads the age of an
+    unreadable clock as UNKNOWN and never reclaims such a run
+    (``detect_stale_running``), while a card with no live run ages from its
+    first-ever start on BOTH sides. The board has to be able to tell them
+    apart, so the payload carries an explicit marker.
+
+    Without the marker the board falls back to the first-ever age and paints
+    a card RED that the engine deliberately protects — the original bug's
+    shape, with the sign flipped.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        # A live run whose start is not a readable timestamp (the shape an
+        # outside writer leaves behind).
+        unreadable = kb.create_task(conn, title="unreadable-clock", assignee="x")
+        lock = "lock-unreadable"
+        future = now + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 30 * 24 * 3600, lock, future, 99999, unreadable),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (unreadable, lock, future, 99999, "not-a-timestamp"),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, unreadable))
+
+        # A live run with a READABLE start: not marked.
+        readable = kb.create_task(conn, title="readable-clock", assignee="x")
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, lock, future, 99999, readable),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (readable, lock, future, 99999, now - 300),
+        )
+        readable_run = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (readable_run, readable))
+
+        # A card with NO live run at all: not marked either.
+        no_run = kb.create_task(conn, title="no-run", assignee="x")
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+    columns = {c["name"]: c for c in r.json()["columns"]}
+    by_id = {c["id"]: c for col in columns.values() for c in col["tasks"]}
+
+    # Unreadable clock: null value AND the marker.
+    assert by_id[unreadable]["current_run_started_at"] is None, by_id[unreadable]
+    assert by_id[unreadable]["current_run_started_at_unreadable"] is True, by_id[unreadable]
+
+    # Readable clock: the epoch int, and NOT marked.
+    assert by_id[readable]["current_run_started_at"] == now - 300, by_id[readable]
+    assert by_id[readable]["current_run_started_at_unreadable"] is False, by_id[readable]
+
+    # No live run: null value, and NOT marked (there is no run to be
+    # unreadable — the card ages from its first-ever start on both sides).
+    assert by_id[no_run]["current_run_started_at"] is None, by_id[no_run]
+    assert by_id[no_run]["current_run_started_at_unreadable"] is False, by_id[no_run]
+
+    # The detail endpoint carries the same contract.
+    detail = client.get(f"/api/plugins/kanban/tasks/{unreadable}").json()["task"]
+    assert detail["current_run_started_at"] is None, detail
+    assert detail["current_run_started_at_unreadable"] is True, detail
+
+
 def test_dashboard_heartbeat_gap_equals_the_engine_constant():
     """The dashboard's heartbeat gap must EQUAL the engine's.
 
