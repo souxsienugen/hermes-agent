@@ -12,10 +12,17 @@ import contextlib
 import logging
 from contextvars import Context
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; the runtime import is deferred
+    from hermes_cli.kanban_db_dispatch import CapacityCaps
 
 # Keep the logger name run.py used so extracted log records are unchanged.
 logger = logging.getLogger("gateway.run")
+
+# The capacity caps that bound how much work may run at once, in the order the
+# dispatcher reports them.
+_CAP_KEYS = ("max_in_progress", "max_in_progress_per_profile", "max_spawn")
 
 
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
@@ -61,6 +68,79 @@ def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
         return None
     logger.info("kanban dispatcher: %s=%d", key, value)
     return value
+
+
+def _resolve_live_capacity_caps(
+    load_config: Callable[[], Any],
+    current: CapacityCaps,
+) -> CapacityCaps:
+    """Live capacity caps, re-read every dispatcher tick.
+
+    The embedded dispatcher used to freeze ``kanban.max_in_progress`` (and the
+    per-profile / per-board caps) at BOOT: ``_resolve_dispatcher_settings`` ran
+    once and its frozen copy was passed to ``dispatch_once`` on every tick. An
+    operator edit to the concurrency ceiling therefore only bound after a gateway
+    restart, while the CLI dispatch path re-read the same keys on every
+    invocation. The two dispatchers disagreed about the host-wide budget and the
+    embedded one -- the only path that admits without an operator in the loop --
+    ran above the operator's ceiling (#38534647).
+
+    Re-read live so a ceiling change binds on the next tick, exactly as it does
+    for the CLI path. Both paths resolve through
+    ``kanban_db_dispatch.resolve_capacity_caps``, so they cannot disagree about
+    what the cap IS.
+
+    ``current`` is the caps in force; it is returned unchanged when the config
+    cannot be read. Fails SAFE: dropping the caps would mean "uncapped", which
+    is the opposite of what a ceiling must do when the config is unreadable.
+    """
+    from hermes_cli.config_read_errors import FailedConfigRead
+    from hermes_cli.kanban_db_dispatch import resolve_capacity_caps
+
+    try:
+        cfg = load_config()
+    except Exception:
+        logger.warning(
+            "kanban dispatcher: cannot re-read the capacity caps; keeping the "
+            "caps in force (max_in_progress=%s)",
+            current.max_in_progress,
+        )
+        return current
+    if not isinstance(cfg, dict) or isinstance(cfg, FailedConfigRead):
+        # A degraded read (config.yaml unparseable) serves defaults or
+        # last-known-good under the FailedConfigRead marker. Honouring it could
+        # widen the ceiling (defaults carry no kanban.max_in_progress), so keep
+        # the caps in force until the file is fixed.
+        logger.warning(
+            "kanban dispatcher: the config read was degraded; keeping the caps in "
+            "force (max_in_progress=%s)",
+            current.max_in_progress,
+        )
+        return current
+    kanban_cfg = cfg.get("kanban", {})
+    if not isinstance(kanban_cfg, dict):
+        kanban_cfg = {}
+    caps = resolve_capacity_caps(kanban_cfg)
+    if caps != current:
+        for key in _CAP_KEYS:
+            new = getattr(caps, key)
+            old = getattr(current, key)
+            if new != old:
+                logger.info(
+                    "kanban dispatcher: %s=%s (re-bound live; was %s)", key, new, old
+                )
+    return caps
+
+
+def _capacity_caps_from_settings(settings: Any) -> CapacityCaps:
+    """The boot-snapshot caps, as the shared ``CapacityCaps`` value."""
+    from hermes_cli.kanban_db_dispatch import CapacityCaps
+
+    return CapacityCaps(
+        max_in_progress=settings.max_in_progress,
+        max_in_progress_per_profile=settings.max_in_progress_per_profile,
+        max_spawn=settings.max_spawn,
+    )
 
 
 def _resolve_auto_decompose_settings(load_config: Callable[[], Any]) -> tuple[bool, int]:
