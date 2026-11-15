@@ -1425,6 +1425,183 @@ def test_board_payload_current_run_started_at_is_an_epoch_int_not_text(client):
     assert card["current_run_started_at"] == 1794479400, card
 
 
+def test_workers_active_started_at_is_an_epoch_int_not_text(client):
+    """``GET /workers/active`` must hand out ``started_at`` as an epoch INT.
+
+    This endpoint reads ``task_runs`` directly (``dict(row)`` over a raw
+    ``SELECT``), so it does NOT go through ``Run.from_row`` — the one place
+    where a raw ``task_runs.started_at`` still left the backend.
+
+    The value CAN be text: ``task_runs.started_at`` has INTEGER affinity, but
+    SQLite does not reject a non-numeric string in an ``INTEGER NOT NULL``
+    column — it stores it as TEXT — and the legacy in-flight backfill copies
+    ``tasks.started_at`` verbatim. A consumer doing ``now - started_at`` on a
+    text value gets NaN.
+
+    The fixture uses a NON-NUMERIC timestamp (ISO-8601) on purpose: SQLite
+    converts a *numeric* string to INTEGER at INSERT (INTEGER affinity), so a
+    numeric fixture would be stored as an int and the assertion would pass
+    even with the coercion reverted — a vacuous test.
+
+    ``last_heartbeat_at`` and ``claim_expires`` ride the same row and get the
+    same treatment for the same reason.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="text-run-workers", assignee="x")
+        lock = "lock-text-run-workers"
+        future = now + 3600
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, lock, future, 99999, t),
+        )
+        # TEXT timestamps, the shape an outside writer leaves behind. ISO-8601
+        # and a non-numeric sentinel both stay TEXT through INTEGER affinity.
+        # ``claim_expires`` is pinned as TEXT too, so the coercion on that
+        # column is asserted rather than merely exercised (an int fixture
+        # would pass with the coercion reverted).
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at, last_heartbeat_at) VALUES (?, 'running', ?, ?, ?, ?, ?)",
+            (t, lock, "2026-11-13T10:00:00Z", 99999, "2026-11-12T10:30:00Z", "2026-11-13T09:00:00Z"),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/workers/active")
+    assert r.status_code == 200, r.text
+    # Select by run_id: opening the board can synthesise an extra legacy
+    # in-flight run row (the backfill that copies tasks.started_at verbatim),
+    # so the row COUNT is not stable — the row's own shape is.
+    w = next(x for x in r.json()["workers"] if x["run_id"] == run_id)
+    # The payload contract is ``number | null`` — never a string, because a
+    # consumer does epoch arithmetic on it.
+    assert isinstance(w["started_at"], int), w["started_at"]
+    assert w["started_at"] == 1794479400, w
+    assert isinstance(w["last_heartbeat_at"], int), w["last_heartbeat_at"]
+    assert w["last_heartbeat_at"] == 1794560400, w
+    assert isinstance(w["claim_expires"], int), w["claim_expires"]
+    assert w["claim_expires"] == 1794564000, w
+
+
+def test_workers_active_started_at_is_null_when_unreadable(client):
+    """An unreadable run clock is ``None``, not a string and not a fake epoch.
+
+    ``_to_epoch`` returns ``None`` for a value it cannot read. The endpoint
+    must pass that ``None`` through: a sentinel like ``0`` would read as
+    "started at the epoch", which is 56 years of age, and would paint any
+    consumer that subtracts it from now as permanently stale.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="garbage-run-workers", assignee="x")
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, "lock-garbage-run-workers", now + 3600, 99999, t),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (t, "lock-garbage-run-workers", now + 3600, 99999, "not-a-timestamp"),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/workers/active")
+    assert r.status_code == 200, r.text
+    w = next(x for x in r.json()["workers"] if x["run_id"] == run_id)
+    # None, not the raw string and not 0.
+    assert w["started_at"] is None, w
+
+
+def test_workers_active_leaves_int_timestamps_unchanged(client):
+    """The coercion is a no-op for the values the codebase actually writes.
+
+    Every ``task_runs`` row this codebase writes carries INTEGER epoch
+    stamps, so the common path must come back byte-identical — the change is
+    a consistency fix, not a behaviour change for real callers.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="int-run-workers", assignee="x")
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, "lock-int-run-workers", now + 3600, 99999, t),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at, last_heartbeat_at) VALUES (?, 'running', ?, ?, ?, ?, ?)",
+            (t, "lock-int-run-workers", now + 3600, 99999, now - 600, now - 60),
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/workers/active")
+    assert r.status_code == 200, r.text
+    w = next(x for x in r.json()["workers"] if x["run_id"] == run_id)
+    assert w["started_at"] == now - 600, w
+    assert w["last_heartbeat_at"] == now - 60, w
+
+
+def test_workers_active_is_ordered_by_the_started_at_it_hands_out(client):
+    """The list must be ascending by the ``started_at`` the consumer reads.
+
+    ``ORDER BY r.started_at ASC`` sorts the RAW column, and SQLite orders by
+    storage class FIRST — INTEGER before TEXT — so a run whose ``started_at``
+    was left as text sorts after every integer run however old it really is.
+    Before the coercion that was invisible (the payload showed the same raw
+    values the sort used). After it, the list would read as NOT ascending by
+    the field it exposes: the earliest run would come last.
+
+    So the endpoint sorts on the coerced value it hands out.
+    """
+    now = int(time.time())
+    conn = kbc.connect()
+    try:
+        t = kb.create_task(conn, title="order-run-workers", assignee="x")
+        conn.execute(
+            "UPDATE tasks SET status='running', started_at=?, claim_lock=?, "
+            "claim_expires=?, worker_pid=? WHERE id=?",
+            (now - 7200, "lock-order-run-workers", now + 3600, 99999, t),
+        )
+        # The EARLIER run, stored as TEXT (epoch 1794479400).
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (t, "lock-order-run-workers", now + 3600, 99999, "2026-11-12T10:30:00Z"),
+        )
+        # The LATER run, stored as INTEGER (epoch 1794600000).
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
+            (t, "lock-order-run-workers", now + 3600, 99999, 1794600000),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/workers/active")
+    assert r.status_code == 200, r.text
+    workers = r.json()["workers"]
+    starts = [w["started_at"] for w in workers]
+    assert all(isinstance(s, int) for s in starts), starts
+    assert starts == sorted(starts), starts
+    # The TEXT run is the older one and must lead.
+    assert starts[0] == 1794479400, starts
+
+
 def test_dashboard_heartbeat_gap_equals_the_engine_constant():
     """The dashboard's heartbeat gap must EQUAL the engine's.
 
@@ -1458,5 +1635,3 @@ def test_dashboard_heartbeat_gap_equals_the_engine_constant():
         f"dashboard heartbeat gap {bundle_gap!r} != engine "
         f"{_STALE_HEARTBEAT_GAP_SECONDS!r}"
     )
-
-

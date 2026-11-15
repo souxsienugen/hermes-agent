@@ -929,7 +929,32 @@ def list_active_workers(board: Optional[str] = _BOARD_Q):
             "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
             "WHERE r.ended_at IS NULL AND r.worker_pid IS NOT NULL AND t.status = 'running' "
             "ORDER BY r.started_at ASC").fetchall()
-        workers = [dict(row) for row in rows]
+        # Every timestamp the backend hands out is an epoch int (or null) -- never
+        # the raw column value. ``started_at``/``claim_expires``/
+        # ``last_heartbeat_at`` have INTEGER affinity, but SQLite stores a
+        # non-numeric text value as TEXT, and outside writers do leave text
+        # timestamps behind (the legacy in-flight backfill in
+        # ``kanban_db_connect`` copies ``tasks.started_at`` verbatim). A consumer
+        # that does epoch arithmetic on a text value gets NaN. This matches the
+        # contract the rest of the API already ships (``Task.from_row`` and
+        # ``Run.from_row`` coerce through ``kanban_db._to_epoch``).
+        workers = [
+            {**dict(row),
+             "started_at": kanban_db._to_epoch(row["started_at"]),
+             "claim_expires": kanban_db._to_epoch(row["claim_expires"]),
+             "last_heartbeat_at": kanban_db._to_epoch(row["last_heartbeat_at"])}
+            for row in rows
+        ]
+        # ``ORDER BY r.started_at ASC`` sorts the RAW column, and SQLite orders
+        # by storage class FIRST (INTEGER before TEXT), so a run whose
+        # started_at was left as text sorts after every integer run no matter
+        # how old it really is. Now that the payload carries epoch ints, sort
+        # on the value actually handed out: the list is ascending by the field
+        # a consumer reads. An unreadable clock (None) sorts last, and ties
+        # keep the SQL order (Python's sort is stable), so the all-integer
+        # case — every row this codebase writes — is unchanged.
+        workers.sort(key=lambda w: (w["started_at"] is None,
+                                    w["started_at"] if w["started_at"] is not None else 0))
         return {"workers": workers, "count": len(workers), "checked_at": int(time.time())}
 
 
