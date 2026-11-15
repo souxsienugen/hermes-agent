@@ -17,9 +17,11 @@ from typing import Any, Optional
 
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
+    _capacity_caps_from_settings,
     _kanban_dispatch_allowed,
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
+    _resolve_live_capacity_caps,
     _gc_retention_days,
     _to_thread_process_service,
     logger,
@@ -269,6 +271,10 @@ class GatewayKanbanWatchersMixin:
         _load_config, _kb, kanban_cfg = boot
         settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
         interval = settings.interval
+        # The boot snapshot is only the starting point for the live caps: every
+        # tick re-reads them from config, so an operator's ceiling edit binds on
+        # the next tick instead of the next gateway restart (#38534647).
+        caps = _capacity_caps_from_settings(settings)
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).
         await asyncio.sleep(5)
@@ -305,7 +311,12 @@ class GatewayKanbanWatchersMixin:
                     # See #49638.
                     if _ad_enabled:
                         await _to_thread_process_service(dispatcher.auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(dispatcher.tick_once)
+                    # Re-read the concurrency caps live so the ceiling the
+                    # operator set is the ceiling the embedded dispatcher
+                    # enforces -- the boot-frozen copy used to admit above it
+                    # while the CLI drain path honoured it (#38534647).
+                    caps = _resolve_live_capacity_caps(_load_config, caps)
+                    results = await _to_thread_process_service(dispatcher.tick_once, caps)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
