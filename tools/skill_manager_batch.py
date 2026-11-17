@@ -85,6 +85,7 @@ def _op_shape_error(action: str, args: dict):
 
 def _validate_batch_ops(operations, default_name, tool_error):
     """Shape checks with no side effects. Returns (names, None) or (None, error_json)."""
+    from tools import skill_manager_tool as _smt
     from tools.skill_manager_guards import _background_review_preflight
     from tools.skill_manager_tool import _validate_category
     def fail(i, msg):
@@ -113,6 +114,14 @@ def _validate_batch_ops(operations, default_name, tool_error):
             return fail(i, f": create for '{nm}' must precede that skill's other ops.")
         if (preflight := _background_review_preflight(act, nm)) is not None:
             return None, json.dumps(preflight, ensure_ascii=False)
+    # Size pre-flight: a write that would push a file past the content ceiling fails INSIDE the
+    # write path, by which time the ops before it have already been applied — so the batch rolls
+    # them back and the lesson they carried is gone. Project each op's size here instead, so the
+    # batch is rejected before anything is written.
+    for i, op in enumerate(operations):
+        act, nm = op["action"], names[i]
+        if (size_err := _smt._write_size_error(nm, act, op)) is not None:
+            return fail(i, f" ({act} on '{nm}'): {size_err}")
     # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on
     # a file an earlier op touched would SILENTLY discard its work — reject it.
     # Additive patches are always legal. Paths are normalized against spelling variants.
