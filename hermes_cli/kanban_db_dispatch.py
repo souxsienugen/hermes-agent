@@ -640,8 +640,10 @@ def _reap_terminal_bound_worker_row(conn, record, live_pids, host_prefix, kill, 
         if not termination["terminated"]:
             return  # still alive: try again next tick
     else:
-        termination = {"pid": pid, "terminated": True, "sigkill": False,
-                       "descendants": [], "descendants_killed": []}
+        # Already gone (or the pid was recycled and belongs to a stranger now, which
+        # is also "gone" for this run): nothing to signal, the run is settled.
+        termination = {"pid": pid, "terminated": False, "already_gone": True,
+                       "sigkill": False, "descendants": [], "descendants_killed": []}
     with _kb.write_txn(conn):
         _kb._append_event(
             conn, record["task_id"], kbw.BOUND_WORKER_REAPED_EVENT,
