@@ -184,13 +184,48 @@ def _description_budget_error(content: str, before: Optional[str] = None) -> Opt
         f"Move detail into the skill body.")
 
 
-def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
-    if len(content) > MAX_SKILL_CONTENT_CHARS:
-        return (
-            f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
-            f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
-            f"or templates/.")
-    return None
+def _current_file_len(path: Path) -> Optional[int]:
+    """Character length of an existing file, or None when it does not exist or cannot be read."""
+    try:
+        return len(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _exceeds_content_cap(size: int, current_len: Optional[int] = None) -> bool:
+    """True when a write of ``size`` characters must be refused by the ceiling.
+
+    The ceiling bounds how much a skill may cost, so it refuses GROWTH past the limit. A
+    file that is ALREADY over the limit may be written smaller: it is a legacy file that
+    drifted past the cap (hand-placed, hub-installed, or grown by an older build), and
+    refusing every write to it — including the shrink that brings it back under — leaves
+    it frozen forever, with the only escape one whole-file rewrite that must land under
+    the cap in a single shot. That escape is exactly how a lesson gets lost: the migration
+    runs as a sequence of patches, and a file that is over the cap refuses every one of
+    them. Refusing the growth of an over-cap file keeps the ceiling's meaning intact: no
+    skill ever grows past it, and one that already did can always walk back down.
+    """
+    if size <= MAX_SKILL_CONTENT_CHARS:
+        return False
+    return current_len is None or size > current_len
+
+
+def _validate_content_size(content: str, label: str = "SKILL.md",
+                           current_len: Optional[int] = None) -> Optional[str]:
+    """Reject content over MAX_SKILL_CONTENT_CHARS (see ``_exceeds_content_cap``).
+
+    ``current_len`` is the character length of the file the write REPLACES (None when the
+    write creates it), which is what lets an over-cap file be shrunk instead of frozen.
+    """
+    if not _exceeds_content_cap(len(content), current_len):
+        return None
+    msg = (f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
+           f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
+           f"or templates/.")
+    if current_len is not None and current_len > MAX_SKILL_CONTENT_CHARS:
+        msg += (f" {label} is already over the limit ({current_len:,} characters): shrink it "
+                f"(move sections into references/) before adding to it.")
+    return msg
 
 
 def _description_of(content: Optional[str]) -> Optional[str]:
