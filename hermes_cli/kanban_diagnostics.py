@@ -13,7 +13,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import logging
 import time
+
+
+_log = logging.getLogger(__name__)
 
 
 # Least → most urgent; sorted outputs put critical first.
@@ -80,6 +84,20 @@ def _task_field(task, name, default=None):
     return getattr(task, name, default)
 
 
+def _epoch(value) -> Optional[int]:
+    """Epoch seconds for a raw timestamp column, or None when it is not a timestamp.
+
+    ``tasks.started_at`` has INTEGER affinity, but SQLite keeps a non-numeric value as
+    TEXT and outside writers do leave text timestamps behind, so a bare ``int()`` raises
+    on them. Coercing through ``kanban_db._to_epoch`` keeps a text timestamp usable and
+    treats an unparseable one as absent instead of raising — a rule that raises is
+    swallowed by the engine, so the diagnostic it would have produced is silently lost.
+    ``kanban_db`` is imported here, not at module scope, to keep the import acyclic.
+    """
+    from hermes_cli import kanban_db as kb
+    return kb._to_epoch(value)
+
+
 def _parse_payload(ev) -> dict:
     """Tolerate event.payload being either a dict or a JSON string."""
     p = _task_field(ev, "payload", None)
@@ -98,7 +116,7 @@ def _event_kind(ev) -> str:
 
 
 def _event_ts(ev) -> int:
-    return int(_task_field(ev, "created_at", 0) or 0)
+    return _epoch(_task_field(ev, "created_at", 0)) or 0
 
 
 def _first_field(task, primary: str, legacy: str, default=None):
@@ -576,7 +594,7 @@ def _rule_running_with_open_parents(task, events, runs, now, cfg) -> list[Diagno
         return []
     task_id = str(_task_field(task, "id") or "")
     parent_ids = [str(parent["id"]) for parent in open_parents]
-    seen_at = int(_task_field(task, "started_at", default=0) or 0) or now
+    seen_at = _epoch(_task_field(task, "started_at", default=0)) or now
     return [Diagnostic(
         kind="running_with_open_parents", severity="warning",
         title=f"Running while {len(parent_ids)} parent(s) are not done",
@@ -700,7 +718,7 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     # task beats missing a stranded one.
     last_ready_ts = _latest_event_ts(events, {"created", "promoted", "reclaimed", "unblocked"})
     if last_ready_ts == 0:
-        last_ready_ts = int(_task_field(task, "created_at", default=0) or 0)
+        last_ready_ts = _epoch(_task_field(task, "created_at", default=0)) or 0
     if last_ready_ts == 0:
         return []
 
@@ -902,8 +920,15 @@ def compute_task_diagnostics(
     for rule in _RULES:
         try:
             out.extend(rule(task, events, runs, now_ts, cfg))
-        except Exception:
-            # A broken rule must never 500 a whole /board request.
+        except Exception as exc:
+            # A broken rule must never 500 a whole /board request. But a swallowed
+            # exception is indistinguishable from a rule that simply did not fire, so
+            # the signal it would have produced disappears without a trace — log it.
+            _log.warning(
+                "kanban diagnostics: rule %s raised on task %s and its diagnostic was dropped: %s",
+                getattr(rule, "__name__", rule), _task_field(task, "id"), exc,
+                exc_info=True,
+            )
             continue
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     out.sort(key=lambda d: (-severity_idx.get(d.severity, -1), -(d.last_seen_at or 0)))
