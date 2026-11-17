@@ -27,6 +27,7 @@ from typing import NamedTuple
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli import kanban_bound_worker as kbw
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -109,6 +110,10 @@ class DispatchResult:
     reaped_terminal_workers: list[str] = field(default_factory=list)
     """Task ids whose worker outlived its closed run and was terminated by
     :func:`reap_terminal_workers`."""
+    reaped_terminal_bound_workers: list[str] = field(default_factory=list)
+    """Task ids whose gateway-parented managed worker outlived its closed run and was
+    terminated by :func:`reap_terminal_bound_workers`. The launcher and the managed
+    worker are different processes, so the launcher reap alone left the agent running."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -571,6 +576,79 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
             )
     if alive:
         reaped.append(row["task_id"])
+
+
+def reap_terminal_bound_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+    """End the gateway-parented managed worker that outlived its closed run.
+
+    The terminal reap above ends the LAUNCHER the dispatcher spawned
+    (``hermes_cli.kanban_worker_client``). The agent itself runs in a SECOND process
+    that the GATEWAY parents (``agent.managed_worker``), and the two are different
+    pids: the launcher's is on ``task_runs.worker_pid``, the managed worker's only in
+    the run's ``worker_bound`` event. So the launcher could be reaped and the card
+    could still have a live managed worker burning provider quota on a DONE card
+    (2026-11-16, twice).
+
+    The managed worker is identified by the spawn fingerprint the gateway recorded in
+    ``worker_bound`` -- the same restart-stable ``<epoch>|<start>`` form as
+    ``worker_started_at`` -- so a recycled pid is never signalled, and a worker whose
+    identity cannot be read is never signalled on a bare pid. Its kernel runner and
+    process supervisor are torn down with it; the gateway is its PARENT and is never
+    a descendant, so it is never reached.
+
+    A worker still bound to an open run is left alone: it is doing live work.
+    Returns the task ids whose bound worker was terminated.
+    """
+    records = kbw.bound_worker_records(conn, ended_before=int(time.time()) - TERMINAL_WORKER_REAP_GRACE_SECONDS)
+    if not records:
+        return []
+    live_pids = kbw.live_bound_worker_pids(conn)
+    host_prefix = _kb._host_prefix()
+    kill = _kill_fn(signal_fn)
+    reaped: list[str] = []
+    for record in records:
+        try:
+            _reap_terminal_bound_worker_row(conn, record, live_pids, host_prefix, kill, reaped)
+        except Exception:
+            _kb._log.debug(
+                "kanban dispatch: bound worker reap failed for run %s (task %s)",
+                record["run_id"], record["task_id"], exc_info=True,
+            )
+    return reaped
+
+
+def _reap_terminal_bound_worker_row(conn, record, live_pids, host_prefix, kill, reaped) -> None:
+    payload = record["payload"]
+    pid = payload.get("pid")
+    fingerprint = payload.get("started_at")
+    if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+        return
+    if pid in live_pids:
+        return  # still bound to an open run: it is doing live work, not leaking
+    if not str(payload.get("claim_lock") or "").startswith(host_prefix):
+        return  # another host's worker: not ours to signal
+    # Only the gateway's own spawn fingerprint authorises a signal. A bare pid is
+    # never enough: the number may belong to an unrelated process by now.
+    if not isinstance(fingerprint, str) or "|" not in fingerprint:
+        return  # unproven identity: never signalled
+    if fingerprint == UNVERIFIED_WORKER_FINGERPRINT:
+        return  # the gateway could not capture the fingerprint either
+    alive = _worker_alive(pid, fingerprint)
+    if alive:
+        termination = kbw.terminate_worker_tree(
+            pid, kill=kill, root_alive=lambda p: _worker_alive(p, fingerprint))
+        if not termination["terminated"]:
+            return  # still alive: try again next tick
+    else:
+        termination = {"pid": pid, "terminated": True, "sigkill": False,
+                       "descendants": [], "descendants_killed": []}
+    with _kb.write_txn(conn):
+        _kb._append_event(
+            conn, record["task_id"], kbw.BOUND_WORKER_REAPED_EVENT,
+            {"pid": pid, "worker_started_at": fingerprint, **termination}, run_id=record["run_id"],
+        )
+    if alive:
+        reaped.append(record["task_id"])
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -2380,6 +2458,7 @@ def _run_reclaim_phase(
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
+    result.reaped_terminal_bound_workers = reap_terminal_bound_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
