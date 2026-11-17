@@ -24,6 +24,20 @@ export interface KanbanTask {
   /** Start of the CURRENT run row; null/absent when the task has no active
    *  run (or the backend predates it) — the clock falls back to started_at. */
   current_run_started_at?: null | number
+  /** True when the card HAS a live run whose start yields NO usable age (the
+   *  run's start is not a readable timestamp, or it reads epoch 0). The run's
+   *  age is then UNKNOWN: the engine never reclaims such a run (an unknown age
+   *  is never over the threshold), so the board must not age it either — and
+   *  the UI must not fall back to the card's FIRST-EVER start, which is never
+   *  reset on re-dispatch. False for a card with NO live run: that one ages
+   *  from its first-ever start on both sides (the engine's own
+   *  COALESCE(r.started_at, t.started_at) fallback), so the two sides already
+   *  agree there and need no marker. */
+  current_run_age_unknown?: boolean
+  /** The PRE-rename spelling of the same marker (`current_run_age_unknown`),
+   *  still emitted by a backend that predates the rename. The desktop and the
+   *  backend update on separate clocks, so both spellings are read. */
+  current_run_started_at_unreadable?: boolean
   worker_pid?: null | number
   last_heartbeat_at?: null | number
   /** Typed block reason set by the backend on kanban_block (one of

@@ -145,7 +145,33 @@ export function RunClock({ task }: { task: KanbanTask }) {
   const k = useKanban()
   // Current run's start; a retried task's started_at is its first-ever start,
   // so tick from the fresh run. Older backends omit the field — fall back.
-  const elapsed = useTicking(task.current_run_started_at ?? task.started_at)
+  const runStart = task.current_run_started_at
+  //
+  // A live run whose age is UNKNOWN has no duration to show, and nothing to
+  // fall back to. Falling back to started_at there would show the card's
+  // FIRST-EVER age, which is never reset on re-dispatch: a card first started
+  // 30 days ago would read "working · 2592000s". The engine never reclaims
+  // such a run (an unknown age is never over the threshold), so the board must
+  // not age it either.
+  //
+  // Two things mark that case, and both are honoured:
+  //
+  //  - The backend's marker. `current_run_age_unknown` is the current
+  //    contract, `current_run_started_at_unreadable` the pre-rename one. The
+  //    desktop and the backend update on separate clocks — the desktop can be
+  //    talking to a backend of either vintage — so a fix that only knew the
+  //    newer name would be inert against every backend that predates it.
+  //  - Epoch 0 itself. It is READABLE but yields no usable age (no real run
+  //    started then), which is the board's own rule
+  //    (kanban_db.run_clock_is_usable: a clock is usable only if it is
+  //    neither None nor 0). Stated here rather than left to fall through on
+  //    0 being falsy, for two reasons: a backend that predates the epoch-0
+  //    marker sends 0 UNMARKED, and the engine never reclaims an epoch-0
+  //    run — so the desktop must not age it either way. Stating the rule
+  //    also keeps it from silently changing if useTicking ever stops
+  //    treating 0 as "no start".
+  const ageUnknown = task.current_run_age_unknown === true || task.current_run_started_at_unreadable === true
+  const elapsed = useTicking(ageUnknown || runStart === 0 ? null : (runStart ?? task.started_at))
 
   if (!elapsed) {
     return null
