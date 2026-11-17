@@ -29,11 +29,17 @@ from tools.skill_manager_tool import (
 
 @pytest.fixture(autouse=True)
 def isolate_skills(tmp_path, monkeypatch):
-    """Redirect SKILLS_DIR to a temp directory."""
+    """Redirect the skills dir to a temp directory.
+
+    ``tools.skills_tool.SKILLS_DIR`` is the shared handle every tree has. The live-lineage
+    tree ALSO carries a module-level ``tools.skill_manager_tool.SKILLS_DIR``, which it reads
+    ahead of the shared one, so it is patched when present (``raising=False``) — the upstream
+    tree dropped that module-level copy in favour of the shared handle.
+    """
     skills_dir = tmp_path / "skills"
     skills_dir.mkdir()
-    monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir)
     monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+    monkeypatch.setattr("tools.skill_manager_tool.SKILLS_DIR", skills_dir, raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     return skills_dir
 
