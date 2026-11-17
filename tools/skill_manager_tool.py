@@ -181,13 +181,120 @@ def _description_budget_error(content: str, before: Optional[str] = None) -> Opt
         f"Move detail into the skill body.")
 
 
-def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
-    if len(content) > MAX_SKILL_CONTENT_CHARS:
-        return (
-            f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
-            f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
-            f"or templates/.")
-    return None
+def _current_file_len(path: Path) -> Optional[int]:
+    """Character length of an existing file, or None when it does not exist or cannot be read."""
+    try:
+        return len(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _existing_content_len(name: str, file_path: str | None = None) -> Optional[int]:
+    """Character length of the file a write to ``name`` would replace, or None when there is none.
+
+    The ceiling refuses GROWTH past the limit, so a file that already sits over it may still be
+    written SMALLER; deciding that needs the length of what is being replaced, not the length
+    of the write. None means the write creates the file, so the ceiling applies at full strength.
+    """
+    existing = _find_skill(name)
+    if not existing:
+        return None
+    return _current_file_len(existing["path"] / (file_path or "SKILL.md"))
+
+
+def _content_size_error(content: str, label: str, name: str,
+                         file_path: str | None = None) -> Optional[str]:
+    """Size check for a write that REPLACES ``name``'s ``file_path`` (SKILL.md when None).
+
+    The current length is read only when the write is actually over the limit, so a write
+    within the limit never pays for the skill-tree lookup.
+    """
+    if len(content) <= MAX_SKILL_CONTENT_CHARS:
+        return None
+    return _validate_content_size(content, label=label,
+                                   current_len=_existing_content_len(name, file_path))
+
+
+def _write_size_error(name: str, action: str, args: dict) -> Optional[str]:
+    """The size error a write WOULD produce, or None when it stays within the ceiling.
+
+    This projects the outcome instead of measuring it, so the batch path can reject a batch
+    that would breach the ceiling BEFORE any op runs: the write path measures the result, and
+    a breach discovered at op[N] has already applied ops 0..N-1, so the batch rolls them back
+    and the lesson they carried is gone.
+
+    A targeted patch's result depends on the fuzzy match, so it is computed the same way the
+    write path computes it. The cheap bound skips the match when no patch could breach: the
+    result can only grow by the new text, so ``current + len(new_string)`` bounds it.
+    """
+    if action == "create":
+        return _validate_content_size(args.get("content") or "")
+    if action == "write_file":
+        file_path = args.get("file_path") or ""
+        return _content_size_error(args.get("file_content") or "", file_path, name, file_path)
+    if action != "patch":
+        return None
+    content = args.get("content")
+    if content:
+        # A full rewrite of SKILL.md.
+        return _content_size_error(content, "SKILL.md", name)
+    # A targeted patch: the result is the file with one region replaced.
+    file_path = args.get("file_path") or "SKILL.md"
+    existing = _find_skill(name)
+    if not existing:
+        return None
+    target = existing["path"] / file_path
+    try:
+        current = target.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    new_string = args.get("new_string")
+    if new_string is None:
+        return None
+    if len(current) + len(new_string) <= MAX_SKILL_CONTENT_CHARS:
+        return None  # cannot breach: the result only grows by the new text
+    from tools.fuzzy_match import fuzzy_find_and_replace
+    new_content, _count, _strategy, match_error = fuzzy_find_and_replace(
+        current, args.get("old_string") or "", new_string, bool(args.get("replace_all")))
+    if match_error:
+        return None  # the write path reports the match failure, which is the better error
+    return _validate_content_size(new_content, label=file_path, current_len=len(current))
+
+
+def _exceeds_content_cap(size: int, current_len: Optional[int] = None) -> bool:
+    """True when a write of ``size`` characters must be refused by the ceiling.
+
+    The ceiling bounds how much a skill may cost, so it refuses GROWTH past the limit. A
+    file that is ALREADY over the limit may be written smaller: it is a legacy file that
+    drifted past the cap (hand-placed, hub-installed, or grown by an older build), and
+    refusing every write to it — including the shrink that brings it back under — leaves
+    it frozen forever, with the only escape one whole-file rewrite that must land under
+    the cap in a single shot. That escape is exactly how a lesson gets lost: the migration
+    runs as a sequence of patches, and a file that is over the cap refuses every one of
+    them. Refusing the growth of an over-cap file keeps the ceiling's meaning intact: no
+    skill ever grows past it, and one that already did can always walk back down.
+    """
+    if size <= MAX_SKILL_CONTENT_CHARS:
+        return False
+    return current_len is None or size > current_len
+
+
+def _validate_content_size(content: str, label: str = "SKILL.md",
+                           current_len: Optional[int] = None) -> Optional[str]:
+    """Reject content over MAX_SKILL_CONTENT_CHARS (see ``_exceeds_content_cap``).
+
+    ``current_len`` is the character length of the file the write REPLACES (None when the
+    write creates it), which is what lets an over-cap file be shrunk instead of frozen.
+    """
+    if not _exceeds_content_cap(len(content), current_len):
+        return None
+    msg = (f"{label} content is {len(content):,} characters (limit: {MAX_SKILL_CONTENT_CHARS:,}). "
+           f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
+           f"or templates/.")
+    if current_len is not None and current_len > MAX_SKILL_CONTENT_CHARS:
+        msg += (f" {label} is already over the limit ({current_len:,} characters): shrink it "
+                f"(move sections into references/) before adding to it.")
+    return msg
 
 
 def _description_of(content: Optional[str]) -> Optional[str]:
@@ -508,7 +615,10 @@ def _create_skill(name: str, content: str, category: str | None = None) -> dict[
 
 def _edit_skill(name: str, content: str) -> dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
-    if err := _validate_frontmatter(content) or _validate_content_size(content):
+    # current_len: the SKILL.md being replaced. A file already over the ceiling may be
+    # rewritten SMALLER (the migration path); one at or under it may not grow past it.
+    if err := (_validate_frontmatter(content)
+               or _content_size_error(content, "SKILL.md", name)):
         return _err(err)
     skill_dir, guard = _locate_for_write(name, "edit")
     # SKILL.md always exists here (_find_skill requires it), so a blocked scan restores it.
@@ -555,7 +665,9 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
             from tools.fuzzy_match import format_no_match_hint
             match_error += format_no_match_hint(match_error, match_count, old_string, content)
         return _err(match_error) | {"file_preview": _clip(content, 500, "...")}
-    if err := _validate_content_size(new_content, label=target_label):
+    # current_len: the file being patched. A file already over the ceiling may be patched
+    # SMALLER (that is how it walks back under); one at or under it may not grow past it.
+    if err := _validate_content_size(new_content, label=target_label, current_len=len(content)):
         return _err(err)
     if not file_path and (err := _validate_frontmatter(new_content)):
         return _err(f"Patch would break SKILL.md structure: {err}")
@@ -625,7 +737,8 @@ def _write_file(name: str, file_path: str, file_content: str) -> dict[str, Any]:
     if (content_bytes := len(file_content.encode("utf-8"))) > MAX_SKILL_FILE_BYTES:
         return _err(f"File content is {content_bytes:,} bytes (limit: {MAX_SKILL_FILE_BYTES:,} "
                     f"bytes / 1 MiB). Consider splitting into smaller files.")
-    if err := _validate_content_size(file_content, label=file_path):
+    # current_len: the supporting file being replaced (None when it does not exist yet).
+    if err := _content_size_error(file_content, file_path, name, file_path):
         return _err(err)
     skill_dir, guard = _locate_for_write(name, "write_file", " Create it first with action='create'.")
     if guard:
