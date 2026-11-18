@@ -32,7 +32,8 @@ from tools.skill_manager_guards import (
     _containing_skills_root, _curator_consolidation_delete_guard, _is_path_redirect, _pinned_guard,
     _validate_delete_target, _is_background_review, _refusal as _err)
 from tools.skill_manager_batch import (
-    _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _op_shape_error, _skill_manage_batch)
+    _PATCH_EITHER_OR, _PATCH_NEEDS_NEW_STRING, _PATCH_NEEDS_OLD_STRING, _batch_target_key,
+    _op_shape_error, _skill_manage_batch)
 from tools.skill_manager_scan import (
     _background_origin, _introduced_findings, _replaying_background_write, _scan_baseline)
 from tools.skills_guard import scan_skill, should_allow_install, format_scan_report
@@ -189,6 +190,20 @@ def _current_file_len(path: Path) -> Optional[int]:
         return None
 
 
+def _contained_file_len(skill_dir: Path, file_path: str | None = None) -> Optional[int]:
+    """Character length of the file inside ``skill_dir`` a write would replace, or None.
+
+    A target that does not resolve inside the skill dir is NEVER read: its length is not ours
+    to disclose (the size pre-flight must not become a side channel for the size of a file
+    outside the tree), and the write path refuses such a path anyway.
+    """
+    from tools.path_security import validate_within_dir
+    target = skill_dir / (file_path or "SKILL.md")
+    if validate_within_dir(target, skill_dir):
+        return None
+    return _current_file_len(target)
+
+
 def _existing_content_len(name: str, file_path: str | None = None) -> Optional[int]:
     """Character length of the file a write to ``name`` would replace, or None when there is none.
 
@@ -199,7 +214,7 @@ def _existing_content_len(name: str, file_path: str | None = None) -> Optional[i
     existing = _find_skill(name)
     if not existing:
         return None
-    return _current_file_len(existing["path"] / (file_path or "SKILL.md"))
+    return _contained_file_len(existing["path"], file_path)
 
 
 def _content_size_error(content: str, label: str, name: str,
@@ -215,50 +230,225 @@ def _content_size_error(content: str, label: str, name: str,
                                    current_len=_existing_content_len(name, file_path))
 
 
-def _write_size_error(name: str, action: str, args: dict) -> Optional[str]:
-    """The size error a write WOULD produce, or None when it stays within the ceiling.
+def _file_path_refusal(skill_dir: Path, file_path: str) -> Optional[str]:
+    """The refusal for a path that may not be written inside ``skill_dir``, or None.
 
-    This projects the outcome instead of measuring it, so the batch path can reject a batch
-    that would breach the ceiling BEFORE any op runs: the write path measures the result, and
-    a breach discovered at op[N] has already applied ops 0..N-1, so the batch rolls them back
-    and the lesson they carried is gone.
-
-    A targeted patch's result depends on the fuzzy match, so it is computed the same way the
-    write path computes it. The cheap bound skips the match when no patch could breach: the
-    result can only grow by the new text, so ``current + len(new_string)`` bounds it.
+    One definition of the path rules, shared by ``_resolve_supporting_file`` (which writes)
+    and the batch size pre-flight (which only measures): a path is validated BEFORE the
+    file behind it is read, because the length of a file outside the skill tree is not
+    ours to disclose.
     """
-    if action == "create":
-        return _validate_content_size(args.get("content") or "")
-    if action == "write_file":
+    from tools.path_security import validate_within_dir
+    target = skill_dir / (file_path or "")
+    return _validate_file_path(file_path) or validate_within_dir(target, skill_dir)
+
+
+def _not_text_error(label: str) -> str:
+    """The refusal for a target that is not UTF-8 text (a binary file)."""
+    return f"File is not valid UTF-8 text: {label}. skill_manage edits text files only."
+
+
+class _BatchSizeProjector:
+    """Projects the size of every file a batch writes, op by op.
+
+    The pre-flight must SIMULATE the batch: an op's result depends on the ops before it,
+    so every op is measured against the content the batch would have at that point, not
+    against the file's on-disk size before the batch started. Measuring every op against
+    the pre-batch size mis-projects every op whose result depends on an earlier one: a
+    batch that grows a file and then breaches it is NOT caught (the breach surfaces inside
+    the write path, after the sibling op was applied and then rolled back, so the lesson
+    it carried is gone with it), and a legal shrink-then-grow batch is refused even though
+    the shrink left room for the growth.
+
+    A targeted patch's result depends on the fuzzy match, so it is computed the same way
+    the write path computes it - against the projected content, not the on-disk one. The
+    fuzzy result is always computed: the old cheap bound ("the result only grows by the
+    new text") holds for a single match only, and with ``replace_all`` the result grows by
+    (matches) x len(new_string), so the bound under-counted and missed the breach.
+    """
+
+    def __init__(self) -> None:
+        self._files: dict[tuple[str, str], Optional[str]] = {}  # (skill, target) -> projected content
+        self._dirs: dict[str, Optional[Path]] = {}               # skill -> dir (None: no such skill)
+        self._halted = False                                     # an op whose outcome is unknown
+
+    def error(self, nm: str, act: str, args: dict) -> Optional[str]:
+        """The size error this op would produce, or None when it stays within the ceiling."""
+        if act == "create":
+            return self._create_error(nm, args)
+        if act == "write_file":
+            return self._write_file_error(nm, args)
+        if act == "patch":
+            return self._patch_error(nm, args)
+        if act == "remove_file":
+            # The file is gone for the ops that follow: an op on it fails in the write
+            # path, so nothing after THAT op runs either.
+            self._files[(nm, _batch_target_key(act, args))] = None
+        return None
+
+    def halted(self) -> bool:
+        """True once an op's outcome is unknown, so no later op's size can be projected."""
+        return self._halted
+
+    def _create_error(self, nm: str, args: dict) -> Optional[str]:
+        """The size error a create would produce."""
+        content = args.get("content") or ""
+        if _validate_frontmatter(content):
+            # The write path refuses this create on its frontmatter and reports the
+            # better error, so no op after it runs either.
+            self._halted = True
+            return None
+        err = _validate_content_size(content)
+        if err is not None:
+            return err
+        if self._dir_of(nm) is not None:
+            # The skill already exists: the write path refuses this create, so no op
+            # after it runs either.
+            self._halted = True
+            return None
+        # The skill does not exist yet: create puts it HERE, so the ops that follow
+        # resolve their paths against this dir.
+        self._dirs[nm] = _resolve_skill_dir(nm, args.get("category"))
+        self._files[(nm, "SKILL.md")] = content
+        return None
+
+    def _write_file_error(self, nm: str, args: dict) -> Optional[str]:
+        """The size error a supporting-file write would produce."""
         file_path = args.get("file_path") or ""
-        return _content_size_error(args.get("file_content") or "", file_path, name, file_path)
-    if action != "patch":
+        content = args.get("file_content") or ""
+        key = (nm, _batch_target_key("write_file", args))
+        skill_dir = self._dir_of(nm)
+        if self._refused_path(skill_dir, file_path):
+            # The write path refuses this path BEFORE it reads the target. The pre-flight
+            # must not read it either: the length of a file outside the skill tree is not
+            # ours to disclose.
+            self._halted = True
+            return None
+        current_len = self._current_len(nm, key, skill_dir, file_path)
+        err = _validate_content_size(content, label=file_path, current_len=current_len)
+        self._files[key] = content
+        return err
+
+    def _patch_error(self, nm: str, args: dict) -> Optional[str]:
+        """The size error a patch would produce."""
+        content = args.get("content")
+        file_path = args.get("file_path") or ""
+        key = (nm, _batch_target_key("patch", args))
+        skill_dir = self._dir_of(nm)
+        if content:
+            # A full rewrite of SKILL.md: the result is the given text. The write path
+            # checks the frontmatter FIRST, so a broken one is its error, not a size error.
+            if _validate_frontmatter(content):
+                self._halted = True
+                return None
+            current_len = self._current_len(nm, key, skill_dir, "SKILL.md")
+            err = _validate_content_size(content, label="SKILL.md", current_len=current_len)
+            self._files[key] = content
+            return err
+        if file_path and self._refused_path(skill_dir, file_path):
+            # The write path refuses this path BEFORE it reads the target. The pre-flight
+            # must not read it either: the length of a file outside the skill tree is not
+            # ours to disclose.
+            self._halted = True
+            return None
+        # A targeted patch: the result is the file with one region replaced.
+        current, state = self._target_content(nm, key, skill_dir, file_path)
+        if state == "binary":
+            # A binary file is not text: the write path refuses it, so the pre-flight
+            # refuses it too instead of letting a UnicodeDecodeError escape the tool.
+            return _not_text_error(file_path or "SKILL.md")
+        if state != "ok":
+            # The target does not exist (or cannot be read): the write path reports that,
+            # and no op after it runs.
+            self._halted = True
+            return None
+        new_string = args.get("new_string")
+        if new_string is None:
+            self._halted = True
+            return None
+        from tools.fuzzy_match import fuzzy_find_and_replace
+        new_content, _count, _strategy, match_error = fuzzy_find_and_replace(
+            current, args.get("old_string") or "", new_string, bool(args.get("replace_all")))
+        if match_error:
+            # The write path reports the match failure, which is the better error; this
+            # op's result is unknown, so the ops after it are not projected either.
+            self._halted = True
+            return None
+        # The write path checks the size BEFORE the frontmatter, so a size breach is the
+        # error it reports; a broken frontmatter is its error only when the size is fine.
+        err = _validate_content_size(new_content, label=file_path or "SKILL.md",
+                                     current_len=len(current))
+        if err is not None:
+            return err
+        if not file_path and _validate_frontmatter(new_content):
+            self._halted = True
+            return None
+        self._files[key] = new_content
         return None
-    content = args.get("content")
-    if content:
-        # A full rewrite of SKILL.md.
-        return _content_size_error(content, "SKILL.md", name)
-    # A targeted patch: the result is the file with one region replaced.
-    file_path = args.get("file_path") or "SKILL.md"
-    existing = _find_skill(name)
-    if not existing:
-        return None
-    target = existing["path"] / file_path
-    try:
-        current = target.read_text(encoding="utf-8-sig")
-    except OSError:
-        return None
-    new_string = args.get("new_string")
-    if new_string is None:
-        return None
-    if len(current) + len(new_string) <= MAX_SKILL_CONTENT_CHARS:
-        return None  # cannot breach: the result only grows by the new text
-    from tools.fuzzy_match import fuzzy_find_and_replace
-    new_content, _count, _strategy, match_error = fuzzy_find_and_replace(
-        current, args.get("old_string") or "", new_string, bool(args.get("replace_all")))
-    if match_error:
-        return None  # the write path reports the match failure, which is the better error
-    return _validate_content_size(new_content, label=file_path, current_len=len(current))
+
+    def _refused_path(self, skill_dir: Optional[Path], file_path: str) -> bool:
+        """True when the write path would refuse this path before it reads anything."""
+        if _validate_file_path(file_path):
+            return True
+        return skill_dir is not None and bool(_file_path_refusal(skill_dir, file_path))
+
+    def _dir_of(self, nm: str) -> Optional[Path]:
+        """The dir a skill's files live in, or None when the skill does not exist."""
+        if nm not in self._dirs:
+            existing = _find_skill(nm)
+            self._dirs[nm] = existing["path"] if existing else None
+        return self._dirs[nm]
+
+    def _current_len(self, nm: str, key: tuple[str, str], skill_dir: Optional[Path],
+                     file_path: str) -> Optional[int]:
+        """The length of the file an op replaces: the projected one, else the on-disk one."""
+        if key in self._files:
+            content = self._files[key]
+            return len(content) if content is not None else None
+        if skill_dir is None:
+            return None  # the skill does not exist: the write creates the file
+        return _contained_file_len(skill_dir, file_path)
+
+    def _target_content(self, nm: str, key: tuple[str, str], skill_dir: Optional[Path],
+                        file_path: str) -> tuple[str, str]:
+        """The content of the file an op patches, and its state.
+
+        State is "ok" (the content is known), "binary" (not UTF-8 text) or "absent" (the
+        write path will refuse the op, so nothing after it can be projected). The content
+        is "" when the state is not "ok".
+        """
+        if key in self._files:
+            content = self._files[key]
+            return (content, "ok") if content is not None else ("", "absent")
+        if skill_dir is None:
+            return "", "absent"
+        target = skill_dir / (file_path or "SKILL.md")
+        try:
+            if not target.exists():
+                return "", "absent"
+            return target.read_text(encoding="utf-8-sig"), "ok"
+        except UnicodeDecodeError:
+            return "", "binary"
+        except OSError:
+            return "", "absent"
+
+
+def _batch_size_error(operations, names) -> Optional[tuple[int, str]]:
+    """The first op whose projected size breaches the ceiling -> ``(index, message)``, or None.
+
+    The projection SIMULATES the batch (see ``_BatchSizeProjector``): an op is measured
+    against the content the ops before it leave behind, so a breach is caught before
+    anything is written and the sibling lesson is never applied and then rolled back.
+    """
+    projector = _BatchSizeProjector()
+    for i, (op, nm) in enumerate(zip(operations, names)):
+        if (err := projector.error(nm, op["action"], op)) is not None:
+            return i, err
+        if projector.halted():
+            # An op whose outcome is unknown failed in the write path, so no op after it
+            # runs: a later breach is never reached.
+            break
+    return None
 
 
 def _exceeds_content_cap(size: int, current_len: Optional[int] = None) -> bool:
@@ -491,10 +681,8 @@ def _validate_file_path(file_path: str) -> Optional[str]:
 def _resolve_supporting_file(skill_dir: Path, file_path: str):
     """Validate ``file_path`` and resolve it inside ``skill_dir``
     -> ``(target, None)`` | ``(None, error_dict)``."""
-    from tools.path_security import validate_within_dir
-    target = skill_dir / (file_path or "")
-    err = _validate_file_path(file_path) or validate_within_dir(target, skill_dir)
-    return (None, _err(err)) if err else (target, None)
+    err = _file_path_refusal(skill_dir, file_path)
+    return (None, _err(err)) if err else (skill_dir / (file_path or ""), None)
 
 
 def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
@@ -653,7 +841,12 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str | N
         return _err(f"File not found: {target.relative_to(skill_dir)}")
     if read_guard := _background_review_read_before_write_guard(name, target, "patch", target_label):
         return read_guard
-    content = target.read_text(encoding="utf-8-sig")
+    try:
+        content = target.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        # A binary file is not text: skill_manage edits text, so refuse it with a JSON error
+        # instead of letting a UnicodeDecodeError escape the tool.
+        return _err(_not_text_error(target_label))
 
     # Use the same fuzzy matching engine as the file patch tool.
     from tools.fuzzy_match import fuzzy_find_and_replace

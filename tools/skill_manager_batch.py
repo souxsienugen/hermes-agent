@@ -83,6 +83,20 @@ def _op_shape_error(action: str, args: dict):
     return None
 
 
+def _batch_target_key(action: str, args: dict) -> str:
+    """The file an op in a batch touches, keyed the way the clobber guard keys it.
+
+    One definition for both: the size pre-flight must agree with the clobber guard on
+    what "the same file" means, or a batch would be projected against a different file
+    than the one it is allowed to touch. Paths are normalized against spelling variants.
+    """
+    full_rewrite = action == "patch" and bool(args.get("content"))
+    fp = (args.get("file_path") or "").strip()
+    if action == "create" or full_rewrite or not fp:
+        return "SKILL.md"
+    return posixpath.normpath(fp.lstrip("/"))
+
+
 def _validate_batch_ops(operations, default_name, tool_error):
     """Shape checks with no side effects. Returns (names, None) or (None, error_json)."""
     from tools import skill_manager_tool as _smt
@@ -117,11 +131,12 @@ def _validate_batch_ops(operations, default_name, tool_error):
     # Size pre-flight: a write that would push a file past the content ceiling fails INSIDE the
     # write path, by which time the ops before it have already been applied — so the batch rolls
     # them back and the lesson they carried is gone. Project each op's size here instead, so the
-    # batch is rejected before anything is written.
-    for i, op in enumerate(operations):
-        act, nm = op["action"], names[i]
-        if (size_err := _smt._write_size_error(nm, act, op)) is not None:
-            return fail(i, f" ({act} on '{nm}'): {size_err}")
+    # batch is rejected before anything is written. The projection SIMULATES the batch: every op
+    # is measured against the content the ops before it leave behind, not against the file's
+    # pre-batch on-disk size.
+    if (breach := _smt._batch_size_error(operations, names)) is not None:
+        i, size_err = breach
+        return fail(i, f" ({operations[i]['action']} on '{names[i]}'): {size_err}")
     # Clobber guard: a DESTRUCTIVE op (create/write_file/remove_file/full rewrite) on
     # a file an earlier op touched would SILENTLY discard its work — reject it.
     # Additive patches are always legal. Paths are normalized against spelling variants.
@@ -130,9 +145,7 @@ def _validate_batch_ops(operations, default_name, tool_error):
         act, nm = op["action"], names[i]
         # create and full-rewrite patch (content) always hit SKILL.md.
         full_rewrite = act == "patch" and bool(op.get("content"))
-        fp = (op.get("file_path") or "").strip()
-        target = ("SKILL.md" if (act == "create" or full_rewrite or not fp)
-                  else posixpath.normpath(fp.lstrip("/")))
+        target = _batch_target_key(act, op)
         key = (nm, target)
         if (act in ("create", "write_file", "remove_file") or full_rewrite) and key in touched_files:
             return fail(i, f": {act} on '{target}' of skill '{nm}' — an earlier op in this "
