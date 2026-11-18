@@ -195,6 +195,142 @@ class TestBatchSizePreflight:
         assert result["operations_applied"] == 2
 
 
+class TestBatchPreflightSimulatesTheBatch:
+    """The pre-flight measures each op against the content the batch leaves behind.
+
+    An op whose resulting size depends on an earlier op must be projected against THAT
+    op's result, not against the file's pre-batch on-disk size: measuring every op
+    against the pre-batch size both misses a breach that only the earlier op's growth
+    creates (the breach then surfaces inside the write path, after the sibling lesson was
+    applied and rolled back) and refuses a legal shrink-then-grow sequence.
+    """
+
+    def test_grow_then_breach_is_caught_before_the_lesson_is_rolled_back(self, isolate_skills):
+        """op[0] grows the file; op[1] breaches ONLY because of that growth.
+
+        Measured against the pre-batch size, op[1] looks legal (the file was under the
+        cap before the batch ran), so the breach surfaces inside the write path — after
+        op[0]'s lesson was applied and then rolled back, and the lesson is lost.
+        """
+        # Start under the cap, with two unique anchors so a patch can target either one.
+        front = "---\nname: t\ndescription: A test skill\n---\n# Test Skill\n\n"
+        start = front + "LESSONTARGET\n" + ("x" * 40000) + "GROWTARGET\n" + ("w" * 40000)
+        start += "z" * (MAX_SKILL_CONTENT_CHARS - 100 - len(start))
+        assert len(start) == MAX_SKILL_CONTENT_CHARS - 100
+        assert json.loads(skill_manage(action="create", name="t", content=start))["success"]
+
+        result = json.loads(skill_manage(action="", name="", operations=[
+            # op[0] grows the file by 66 chars (still under the cap) and carries the lesson.
+            {"name": "t", "action": "patch", "old_string": "LESSONTARGET",
+             "new_string": "LESSONTARGET\n- lesson; why.\n" + ("y" * 50)},
+            # op[1] adds 80 more: 99,980 against the PRE-batch size (under the cap, so
+            # the old pre-flight missed it), 100,046 against op[0]'s result (over it).
+            {"name": "t", "action": "patch", "old_string": "GROWTARGET",
+             "new_string": "GROWTARGET" + ("z" * 80)},
+        ]))
+        assert result["success"] is False, result
+        # The pre-flight named the op that actually breaches, and caught it BEFORE
+        # anything was written: no sibling op was applied and then rolled back.
+        assert "operations[1]" in result["error"]
+        assert "rolled back" not in result["error"]
+        content = (isolate_skills / "t" / "SKILL.md").read_text(encoding="utf-8")
+        assert "lesson; why" not in content
+
+    def test_shrink_then_grow_stays_legal(self, isolate_skills):
+        """A legal shrink-then-grow sequence must NOT be refused.
+
+        op[0] shrinks an over-cap file to ~40,000 chars; op[1] grows that result to
+        ~40,500, still under the cap. Measured against the pre-batch (over-cap) size,
+        op[1] looks like a growth of an over-cap file and is refused — breaking the
+        migration sequence this ceiling exists to enable.
+        """
+        skill_dir = isolate_skills / "big-skill"
+        skill_dir.mkdir(parents=True)
+        front = "---\nname: big-skill\ndescription: A test skill\n---\n# Test Skill\n\n"
+        over_cap = front + "SHRINKTARGET\n" + ("x" * 60000) + "GROWTARGET\n" + ("y" * 40000)
+        (skill_dir / "SKILL.md").write_text(over_cap, encoding="utf-8")
+        assert len(over_cap) > MAX_SKILL_CONTENT_CHARS
+
+        result = json.loads(skill_manage(action="", name="", operations=[
+            # op[0] shrinks it: the ceiling allows an over-cap file to be written smaller.
+            {"name": "big-skill", "action": "patch",
+             "old_string": "SHRINKTARGET\n" + ("x" * 60000), "new_string": "SHRUNK"},
+            # op[1] grows the SHRUNK file: ~40,500 chars, well under the cap.
+            {"name": "big-skill", "action": "patch", "old_string": "GROWTARGET",
+             "new_string": "GROWTARGET" + ("q" * 500)},
+        ]))
+        assert result["success"] is True, result
+        content = (isolate_skills / "big-skill" / "SKILL.md").read_text(encoding="utf-8")
+        assert len(content) < MAX_SKILL_CONTENT_CHARS
+        assert len(content) < len(over_cap)
+
+    def test_replace_all_counts_every_match(self, isolate_skills):
+        """A replace_all op grows the file by (matches) x len(new_string), not once.
+
+        The old cheap bound ("the result only grows by the new text") under-counted a
+        replace_all, so the pre-flight returned no error for an op that WOULD breach.
+        """
+        # 400 characters, each 'x' is a match: 400 x 400 = 160,000 chars.
+        body = "# Test Skill\n\n" + ("x" * 400)
+        content = f"---\nname: r\ndescription: A test skill\n---\n{body}"
+        assert json.loads(skill_manage(action="create", name="r", content=content))["success"]
+
+        result = json.loads(skill_manage(action="", name="", operations=[
+            {"name": "r", "action": "patch", "old_string": "x", "new_string": "y" * 400,
+             "replace_all": True},
+        ]))
+        assert result["success"] is False, result
+        assert "operations[0]" in result["error"]
+        # The PRE-FLIGHT caught it, before any op ran: the write path's own refusal
+        # would name the op as FAILED and roll the batch back.
+        assert "rolled back" not in result["error"]
+        # 400 matches x 400 chars of new text: the result is 160,056 chars, not 800.
+        assert "160,056 characters" in result["error"]
+
+    def test_an_out_of_tree_path_is_refused_before_it_is_read(self, isolate_skills):
+        """A path outside the skill tree must be refused WITHOUT reading the target.
+
+        Reading it first turned the size pre-flight into a side channel: the refusal
+        message carried the out-of-tree file's exact character count.
+        """
+        skill_dir = isolate_skills / "probe"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(_skill_content("probe", 500), encoding="utf-8")
+        # A file OUTSIDE the skill tree, with a length the tool must never disclose.
+        victim = isolate_skills.parent / "victim.txt"
+        victim.write_text("v" * 123456, encoding="utf-8")
+
+        result = json.loads(skill_manage(action="", name="", operations=[
+            # The write is over the cap AND over the victim's length, so a pre-flight
+            # that reads the victim first reports it as "already over the limit
+            # (123,456 characters)" — disclosing a file outside the skill tree.
+            {"name": "probe", "action": "write_file",
+             "file_path": str(victim),
+             "file_content": "x" * (MAX_SKILL_CONTENT_CHARS + 100000)},
+        ]))
+        assert result["success"] is False, result
+        # The refusal names the path problem, and discloses NOTHING about the target's size.
+        assert "123,456" not in result["error"]
+        assert "characters" not in result["error"]
+        assert victim.read_text(encoding="utf-8") == "v" * 123456
+
+    def test_a_binary_path_returns_a_json_error_instead_of_raising(self, isolate_skills):
+        """A binary file_path must yield a JSON error, not an uncaught UnicodeDecodeError."""
+        skill_dir = isolate_skills / "probe"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(_skill_content("probe", 500), encoding="utf-8")
+        blob = skill_dir / "references"
+        blob.mkdir()
+        (blob / "b.bin").write_bytes(b"\xff\xfe\x00binary")
+
+        result = json.loads(skill_manage(action="", name="", operations=[
+            {"name": "probe", "action": "patch", "file_path": "references/b.bin",
+             "old_string": "binary", "new_string": "text"},
+        ]))
+        assert result["success"] is False, result
+        assert "not valid UTF-8" in result["error"]
+
+
 class TestValidateContentSizeCurrentLen:
     """The unit behind the ratchet."""
 
