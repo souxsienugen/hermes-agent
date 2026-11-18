@@ -110,6 +110,15 @@ def verify(originals: Path, skills_root: Path) -> tuple[int, int, list[str]]:
     return checked, ok, problems
 
 
+def _out(line: str = "") -> None:
+    """Write one report line to stdout.
+
+    A CLI's report is its output, not a debug print: the repo's own scripts write it
+    the same way (``scripts/ci/check_lazy_deps_imports.py``).
+    """
+    sys.stdout.write(line + "\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--originals", required=True, type=Path,
@@ -122,20 +131,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not args.originals.is_dir():
-        print(f"not a directory: {args.originals}", file=sys.stderr)
+        sys.stderr.write(f"not a directory: {args.originals}\n")
         return 2
     if not args.skills_root.is_dir():
-        print(f"not a directory: {args.skills_root}", file=sys.stderr)
+        sys.stderr.write(f"not a directory: {args.skills_root}\n")
         return 2
 
     if args.manifest and args.manifest.is_file():
         for entry in json.loads(args.manifest.read_text(encoding="utf-8-sig")):
-            print(f"  {entry['chars']:>9,} chars  {entry['name']}  sha256={entry['sha256'][:16]}")
+            _out(f"  {entry['chars']:>9,} chars  {entry['name']}  sha256={entry['sha256'][:16]}")
 
     checked, ok, problems = verify(args.originals, args.skills_root)
-    print(f"\n{ok}/{checked} skills: every original section is present")
+    _out(f"\n{ok}/{checked} skills: every original section is present")
     for problem in problems:
-        print(f"  FAIL {problem}")
+        _out(f"  FAIL {problem}")
     return 0 if ok == checked and checked else 1
 
 
