@@ -69,15 +69,16 @@ def _scratch_base(excluded):
 def _prepare_board(board_dir_arg):
     """Point every board resolution at a scratch board; return its DB path.
 
-    Refuses (loudly, before any write) to target a board inside the live tree
-    or the board a worker session pinned.
+    Refuses (loudly, before any write, and before creating the board directory)
+    to target a board inside the live tree, inside the delegation fence root,
+    the board a worker session pinned, or any board the delegation fence
+    marker covers.
     """
     live_tree = _live_board_tree()
     fence_root = _fence_root()
     excluded = [live_tree] + ([fence_root] if fence_root else [])
     if board_dir_arg:
         board_dir = Path(board_dir_arg).expanduser().resolve()
-        board_dir.mkdir(parents=True, exist_ok=True)
     else:
         board_dir = Path(tempfile.mkdtemp(
             prefix='hermes-pr-acceptance-board-', dir=str(_scratch_base(excluded))))
@@ -98,6 +99,9 @@ def _prepare_board(board_dir_arg):
             'the delegation fence marker covers every board in this process '
             f'(including {board_path}); run the probe outside a delegated-child context'
         )
+    # Only now, with every refusal passed, create the board directory: a refused
+    # probe must not leave a directory behind in the tree it just refused.
+    board_dir.mkdir(parents=True, exist_ok=True)
     return board_path
 
 
