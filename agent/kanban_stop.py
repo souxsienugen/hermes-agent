@@ -4,6 +4,14 @@ the card to whoever owns it next (``kanban_complete``, ``kanban_block``,
 and stop with no tool calls; Hermes treats that as a clean exit → ``rc=0`` → dispatcher
 ``protocol_violation``. Policy-only: return a bounded synthetic nudge so the loop continues
 instead of exiting.
+
+The same exit-without-a-handoff happens when a TOOL GUARDRAIL halts the turn (the
+identical-result guard on a read-only call). That path ends the turn from inside the tool
+round, so it never reaches the text-response stop gates below, and the worker exits with
+the harness's "I stopped retrying ..." question and no terminal board call — the dispatcher
+books a ``protocol_violation`` and respawns it onto the same read, forever. This module
+supplies the guardrail-specific nudge for that path so the worker is told to either read a
+DIFFERENT path/offset or park the card with ``kanban_block(kind=needs_input)``.
 """
 
 from __future__ import annotations
@@ -98,4 +106,65 @@ def build_kanban_stop_nudge(
     )
 
 
-__all__ = ["build_kanban_stop_nudge", "kanban_stop_nudge_enabled", "session_called_kanban_terminal"]
+def build_kanban_guardrail_halt_nudge(
+    *,
+    messages: Iterable[dict] | None = None,
+    tool_name: str = "",
+    code: str = "",
+    count: int = 0,
+    attempts: int = 0,
+    max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Synthetic follow-up for a kanban worker whose turn was ended by a TOOL GUARDRAIL.
+
+    A guardrail halt (the identical-result guard on a read-only call) ends the turn from
+    inside the tool round, so the text-response stop gates never run and the worker has
+    no terminal board call when it exits. The dispatcher books that as a
+    ``protocol_violation`` and respawns the card onto the same read — the respawn loop
+    this card tracks.
+
+    The nudge gives the worker the two ways out the guard itself names: read a DIFFERENT
+    path/offset, or park the card for a human with ``kanban_block(kind=needs_input)``
+    naming the blocked path. It never asks the worker to repeat the blocked call.
+
+    ``None`` when the guard should not fire: not a kanban worker, a terminal board call
+    already made, or the nudge budget spent.
+    """
+    if (
+        not kanban_stop_nudge_enabled()
+        or attempts >= max_attempts
+        or session_called_kanban_terminal(messages)
+    ):
+        return None
+
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    tool = (tool_name or "").strip() or "that tool"
+    what = f"`{tool}`" if tool_name else "the tool"
+    detail = f" after {count} identical calls" if count else ""
+    code_txt = f" (`{code}`)" if code else ""
+    return (
+        "[System: You are a Hermes kanban worker. A guardrail halt is NOT a terminal "
+        "state for the board.\n\n"
+        f"Task `{tid}` is still `running`: the tool guardrail stopped {what}{detail}"
+        f"{code_txt} because it kept returning the same result. Ending the turn now "
+        "causes a protocol violation (clean exit with the card still `running`), and the "
+        "card will be respawned onto the same blocked call.\n\n"
+        "Do this immediately in your next response — do not narrate intent:\n"
+        f"1. Do NOT repeat the blocked call. Read a DIFFERENT path or offset (the "
+        f"result you already have is enough for the blocked {what}); or\n"
+        "2. If you genuinely cannot proceed without that exact read, park the card for "
+        "a human with `kanban_block(kind=needs_input, reason=...)` naming the blocked "
+        "path and what you needed from it. A blocked card waits for a human — it does "
+        "not respawn.\n\n"
+        "Never end a turn with only a promise of future action. Repeated "
+        "protocol violations will block this task and require manual intervention.]"
+    )
+
+
+__all__ = [
+    "build_kanban_guardrail_halt_nudge",
+    "build_kanban_stop_nudge",
+    "kanban_stop_nudge_enabled",
+    "session_called_kanban_terminal",
+]

@@ -10,6 +10,7 @@ from __future__ import annotations
 from contextlib import suppress
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any, Dict, Optional, Tuple
 
 from agent.message_metadata import append_message
@@ -44,6 +45,30 @@ class ToolRoundVerdict:
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
     result: Optional[dict[str, Any]] = None
+
+
+def _guardrail_halt_kanban_nudge(agent: Any, messages: Any, decision: Any) -> Optional[str]:
+    """The kanban guardrail-halt nudge, or ``None`` when it must not fire.
+
+    Fires only for a dispatcher-owned kanban worker that has made no terminal board
+    call yet, and only within the nudge budget. Every failure mode here is a
+    no-nudge: a non-kanban session (an interactive chat must still see the plain halt
+    text), a worker that already handed the card off, an exhausted budget, or an
+    unexpected error in the nudge builder.
+    """
+    try:
+        from agent.kanban_stop import build_kanban_guardrail_halt_nudge
+
+        return build_kanban_guardrail_halt_nudge(
+            messages=messages,
+            tool_name=str(getattr(decision, "tool_name", "") or ""),
+            code=str(getattr(decision, "code", "") or ""),
+            count=int(getattr(decision, "count", 0) or 0),
+            attempts=getattr(agent, "_kanban_guardrail_halt_nudges", 0),
+        )
+    except Exception:
+        logger.debug("kanban guardrail-halt nudge check failed", exc_info=True)
+        return None
 
 
 def run_tool_round(
@@ -195,6 +220,30 @@ def run_tool_round(
                 with suppress(Exception):
                     agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
+        # A kanban worker must end with a terminal board call. This halt ends the turn
+        # from inside the tool round, so the text-response stop gates never run and the
+        # worker would exit rc=0 with no handoff — the dispatcher books that as a
+        # protocol_violation and respawns the card onto the same blocked read, forever.
+        # Nudge the worker instead of exiting: read a DIFFERENT path/offset, or park the
+        # card for a human with kanban_block(kind=needs_input) naming the blocked path.
+        _halt_nudge = _guardrail_halt_kanban_nudge(agent, messages, decision)
+        if _halt_nudge:
+            append_message(messages, {"role": "user", "content": _halt_nudge})
+            agent._session_messages = messages
+            # The halt itself is spent: clear it so the next round is not halted again
+            # by the same decision, and let the model answer the nudge.
+            agent._tool_guardrail_halt_decision = None
+            agent._kanban_guardrail_halt_nudges = (
+                getattr(agent, "_kanban_guardrail_halt_nudges", 0) + 1
+            )
+            final_response = None
+            logger.info(
+                "kanban guardrail-halt nudge issued (attempt %d) task=%s tool=%s",
+                agent._kanban_guardrail_halt_nudges,
+                os.environ.get("HERMES_KANBAN_TASK", ""),
+                decision.tool_name,
+            )
+            return _verdict("continue")
         return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
