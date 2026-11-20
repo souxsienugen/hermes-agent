@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from agent.kanban_stop import (
+    build_kanban_guardrail_halt_nudge,
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
@@ -160,3 +163,127 @@ def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     # The nudge offers every worker exit, not just close-out; a card that must go
     # through review must never be steered to ``kanban_complete`` alone.
     assert "kanban_request_review" in nudge and "kanban_block" in nudge
+
+
+# ── Guardrail-halt nudge (the tool-guardrail path) ───────────────────
+# A tool guardrail halt ends the turn from INSIDE the tool round, so the
+# text-response stop gates above never run: without its own nudge the worker
+# exits rc=0 with no terminal board call, the dispatcher books that as a
+# protocol_violation, and the card respawns onto the same blocked read.
+# These tests pin the nudge's contract and its no-nudge edges.
+
+
+def _halt_nudge(clear_kanban_env, **kwargs):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    params = {
+        "messages": [{"role": "user", "content": "work kanban task"}],
+        "tool_name": "read_file",
+        "code": "idempotent_no_progress_block",
+        "count": 5,
+    }
+    params.update(kwargs)
+    return build_kanban_guardrail_halt_nudge(**params)
+
+
+def test_guardrail_halt_nudge_fires_for_kanban_worker(clear_kanban_env):
+    """The guardrail path gets its OWN nudge: the text-response gates never run there."""
+    nudge = _halt_nudge(clear_kanban_env)
+    assert nudge is not None
+    # It must name the card, the blocked tool and the structured decision code,
+    # so the worker knows WHICH card is stuck and WHY.
+    assert "t_46be8aa5" in nudge
+    assert "read_file" in nudge
+    assert "idempotent_no_progress_block" in nudge
+    # Both ways out, and the parking route is a HUMAN-gated one: a blocked card
+    # waits for a human instead of respawning onto the same read.
+    assert "kanban_block" in nudge and "needs_input" in nudge
+    # It must never ask for the blocked call again — that is the respawn loop.
+    assert "Do NOT repeat the blocked call" in nudge
+
+
+def test_guardrail_halt_nudge_absent_for_non_kanban_session(clear_kanban_env):
+    """An interactive chat must still see the plain harness halt text."""
+    assert build_kanban_guardrail_halt_nudge(
+        messages=[], tool_name="read_file", code="idempotent_no_progress_block",
+    ) is None
+
+
+def test_guardrail_halt_nudge_disabled_by_env(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
+    assert build_kanban_guardrail_halt_nudge(messages=[]) is None
+
+
+def test_guardrail_halt_nudge_absent_after_terminal_call(clear_kanban_env):
+    """A worker that already handed the card off must not be told to park it."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_block", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": "kanban_block", "tool_call_id": "1", "content": "ok"},
+    ]
+    assert build_kanban_guardrail_halt_nudge(messages=messages, tool_name="read_file") is None
+
+
+def test_guardrail_halt_nudge_budget_is_bounded(clear_kanban_env):
+    """The nudge budget is finite: a worker that ignores it is not nudged forever."""
+    assert _halt_nudge(clear_kanban_env, attempts=1) is not None
+    assert _halt_nudge(clear_kanban_env, attempts=2) is None
+    assert _halt_nudge(clear_kanban_env, attempts=2, max_attempts=3) is not None
+
+
+def test_guardrail_halt_nudge_helper_returns_nudge_for_kanban_worker(clear_kanban_env):
+    """The tool-round helper wires the decision's fields into the nudge."""
+    from agent.turn_tool_round import _guardrail_halt_kanban_nudge
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    agent = SimpleNamespace(_kanban_guardrail_halt_nudges=0)
+    decision = SimpleNamespace(
+        tool_name="read_file", code="idempotent_no_progress_block", count=5,
+    )
+    nudge = _guardrail_halt_kanban_nudge(agent, [{"role": "user", "content": "go"}], decision)
+    assert nudge is not None
+    assert "read_file" in nudge
+    assert "t_46be8aa5" in nudge
+
+
+def test_guardrail_halt_nudge_helper_is_none_for_non_kanban_worker(clear_kanban_env):
+    """A non-kanban session gets no nudge (the plain halt text is shown instead)."""
+    from agent.turn_tool_round import _guardrail_halt_kanban_nudge
+
+    agent = SimpleNamespace(_kanban_guardrail_halt_nudges=0)
+    decision = SimpleNamespace(
+        tool_name="read_file", code="idempotent_no_progress_block", count=5,
+    )
+    assert _guardrail_halt_kanban_nudge(agent, [{"role": "user", "content": "go"}], decision) is None
+
+
+def test_guardrail_halt_nudge_helper_swallows_builder_errors(clear_kanban_env, monkeypatch):
+    """A broken nudge builder must never crash the tool round."""
+    from agent import kanban_stop
+    from agent.turn_tool_round import _guardrail_halt_kanban_nudge
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    agent = SimpleNamespace(_kanban_guardrail_halt_nudges=0)
+    decision = SimpleNamespace(
+        tool_name="read_file", code="idempotent_no_progress_block", count=5,
+    )
+
+    def _boom(**_kwargs):
+        raise RuntimeError("nudge builder exploded")
+
+    # The tool round imports the builder lazily, so the SOURCE module is what
+    # has to be patched for the helper to see the failure.
+    monkeypatch.setattr(kanban_stop, "build_kanban_guardrail_halt_nudge", _boom)
+    assert _guardrail_halt_kanban_nudge(
+        agent, [{"role": "user", "content": "go"}], decision
+    ) is None
